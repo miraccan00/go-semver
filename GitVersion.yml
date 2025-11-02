@@ -1,0 +1,10 @@
+next-version: 0.0.1
+mode: ContinuousDeployment
+branches:
+  main:
+    increment: Minor
+    prevent-increment-of-merged-branch-version: true
+    track-merge-target: false
+    regex: ^main$
+    source-branches: ['develop']
+    is-mainline: true

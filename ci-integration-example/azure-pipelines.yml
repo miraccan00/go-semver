@@ -1,0 +1,200 @@
+# Azure Pipelines — go-semver integration example
+#
+# Prerequisites:
+#   - Add REGISTRY_URL, REGISTRY_USER, REGISTRY_PASS as pipeline variables
+#     (or use an Azure Container Registry service connection).
+#   - Ensure the agent has Docker available (ubuntu-latest includes it).
+
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+  paths:
+    exclude:
+      - VERSION   # prevent loops when the version commit is pushed back
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  IMAGE_NAME: "myapp"
+  # Set REGISTRY_URL in pipeline variables, e.g. myacr.azurecr.io
+
+stages:
+
+# ── Stage: Version ─────────────────────────────────────────────────────────────
+- stage: Version
+  displayName: "Bump Version"
+  jobs:
+    - job: RunGoSemver
+      displayName: "Run go-semver"
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - checkout: self
+          fetchDepth: 0             # REQUIRED — full history for go-semver
+
+        - script: |
+            VERSION_JSON=$(docker run --rm \
+              -v $(Build.SourcesDirectory):/workspace \
+              -w /workspace \
+              ghcr.io/miraccan00/go-semver:latest)
+
+            echo "##[debug]$VERSION_JSON"
+
+            APP_VERSION=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')
+            FULL_SEMVER=$(echo $VERSION_JSON | jq -r '.FullSemVer')
+            SHORT_SHA=$(echo $VERSION_JSON  | jq -r '.ShortSha')
+            BRANCH_NAME=$(echo $VERSION_JSON | jq -r '.EscapedBranchName')
+            DIRTY=$(echo $VERSION_JSON      | jq    '.UncommittedChanges')
+
+            if [ "$DIRTY" -gt 0 ]; then
+              echo "##[error]$DIRTY uncommitted change(s) detected. Commit everything before running the pipeline."
+              exit 1
+            fi
+
+            # Publish as pipeline variables for downstream stages
+            echo "##vso[task.setvariable variable=APP_VERSION;isOutput=true]$APP_VERSION"
+            echo "##vso[task.setvariable variable=FULL_SEMVER;isOutput=true]$FULL_SEMVER"
+            echo "##vso[task.setvariable variable=SHORT_SHA;isOutput=true]$SHORT_SHA"
+            echo "##vso[task.setvariable variable=BRANCH_NAME;isOutput=true]$BRANCH_NAME"
+
+            echo "Version resolved: $APP_VERSION ($FULL_SEMVER)"
+          name: semver
+          displayName: "Resolve version with go-semver"
+
+# ── Stage: Test ────────────────────────────────────────────────────────────────
+- stage: Test
+  displayName: "Test"
+  dependsOn: []             # runs in parallel with Version stage
+  jobs:
+    - job: UnitTests
+      displayName: "Go Unit Tests"
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - checkout: self
+          fetchDepth: 1
+
+        - task: GoTool@0
+          inputs:
+            version: "1.22"
+
+        - script: go test ./...
+          displayName: "go test ./..."
+
+# ── Stage: Build ───────────────────────────────────────────────────────────────
+- stage: Build
+  displayName: "Build"
+  dependsOn:
+    - Version
+    - Test
+  variables:
+    APP_VERSION: $[ stageDependencies.Version.RunGoSemver.outputs['semver.APP_VERSION'] ]
+    SHORT_SHA:   $[ stageDependencies.Version.RunGoSemver.outputs['semver.SHORT_SHA'] ]
+    BRANCH_NAME: $[ stageDependencies.Version.RunGoSemver.outputs['semver.BRANCH_NAME'] ]
+  jobs:
+    - job: BuildBinary
+      displayName: "Build Go Binary"
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - task: GoTool@0
+          inputs:
+            version: "1.22"
+
+        - script: |
+            go build \
+              -ldflags "-X main.version=$(APP_VERSION) -X main.commit=$(SHORT_SHA)" \
+              -o $(Build.ArtifactStagingDirectory)/myapp \
+              ./cmd/myapp
+          displayName: "go build"
+
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+            ArtifactName: "myapp-$(APP_VERSION)"
+
+    - job: BuildDocker
+      displayName: "Build Docker Image"
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - checkout: self
+          fetchDepth: 1
+
+        - task: Docker@2
+          displayName: "Build image"
+          inputs:
+            command: build
+            repository: $(REGISTRY_URL)/$(IMAGE_NAME)
+            tags: |
+              $(APP_VERSION)
+              $(SHORT_SHA)
+              $(BRANCH_NAME)
+            arguments: "--build-arg APP_VERSION=$(APP_VERSION)"
+
+        - script: |
+            docker save $(REGISTRY_URL)/$(IMAGE_NAME):$(APP_VERSION) | gzip \
+              > $(Build.ArtifactStagingDirectory)/image.tar.gz
+          displayName: "Save image tarball"
+
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: "$(Build.ArtifactStagingDirectory)/image.tar.gz"
+            ArtifactName: "docker-image"
+
+# ── Stage: Publish ─────────────────────────────────────────────────────────────
+- stage: Publish
+  displayName: "Publish"
+  dependsOn: Build
+  condition: and(succeeded(), in(variables['Build.SourceBranchName'], 'main', 'refs/heads/main'))
+  variables:
+    APP_VERSION: $[ stageDependencies.Version.RunGoSemver.outputs['semver.APP_VERSION'] ]
+    SHORT_SHA:   $[ stageDependencies.Version.RunGoSemver.outputs['semver.SHORT_SHA'] ]
+  jobs:
+    - deployment: PushDocker
+      displayName: "Push to Container Registry"
+      pool:
+        vmImage: ubuntu-latest
+      environment: "production"     # add an approval gate here if needed
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: DownloadBuildArtifacts@1
+                inputs:
+                  artifactName: "docker-image"
+                  downloadPath: "$(Pipeline.Workspace)"
+
+              - script: |
+                  docker load < $(Pipeline.Workspace)/docker-image/image.tar.gz
+                  echo "$(REGISTRY_PASS)" | docker login $(REGISTRY_URL) \
+                    -u $(REGISTRY_USER) --password-stdin
+                  docker push $(REGISTRY_URL)/$(IMAGE_NAME):$(APP_VERSION)
+                  docker push $(REGISTRY_URL)/$(IMAGE_NAME):$(SHORT_SHA)
+                  docker tag  $(REGISTRY_URL)/$(IMAGE_NAME):$(APP_VERSION) \
+                              $(REGISTRY_URL)/$(IMAGE_NAME):latest
+                  docker push $(REGISTRY_URL)/$(IMAGE_NAME):latest
+                displayName: "Push Docker image"
+
+    - job: CommitVersion
+      displayName: "Commit bumped VERSION"
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - checkout: self
+          persistCredentials: true
+          fetchDepth: 0
+
+        - script: |
+            git config user.name  "azure-pipelines[bot]"
+            git config user.email "azure-pipelines[bot]@noreply.example.com"
+            git add VERSION
+            git diff --cached --quiet && echo "VERSION unchanged, nothing to commit." && exit 0
+            git commit -m "chore: bump version to $(APP_VERSION) [skip ci]"
+            git push origin HEAD:$(Build.SourceBranchName)
+          displayName: "Push VERSION commit back"

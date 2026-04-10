@@ -1,0 +1,129 @@
+name: CI — Build & Push with go-semver
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+    paths-ignore:
+      - "VERSION"   # prevent recursive runs from the version bump commit
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "VERSION"
+
+permissions:
+  contents: write   # needed to commit back the bumped VERSION file
+  packages: write   # needed to push to GHCR
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  version:
+    name: Bump Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.semver.outputs.version }}
+      full_semver: ${{ steps.semver.outputs.full_semver }}
+      short_sha: ${{ steps.semver.outputs.short_sha }}
+      branch: ${{ steps.semver.outputs.branch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # REQUIRED — go-semver reads the full git log
+
+      - name: Run go-semver
+        id: semver
+        run: |
+          VERSION_JSON=$(docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            ghcr.io/miraccan00/go-semver:latest)
+
+          echo "version=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')"   >> $GITHUB_OUTPUT
+          echo "full_semver=$(echo $VERSION_JSON | jq -r '.FullSemVer')"    >> $GITHUB_OUTPUT
+          echo "short_sha=$(echo $VERSION_JSON | jq -r '.ShortSha')"        >> $GITHUB_OUTPUT
+          echo "branch=$(echo $VERSION_JSON | jq -r '.EscapedBranchName')"  >> $GITHUB_OUTPUT
+
+          # Fail fast on a dirty workspace
+          DIRTY=$(echo "$VERSION_JSON" | jq '.UncommittedChanges')
+          if [ "$DIRTY" -gt 0 ]; then
+            echo "ERROR: $DIRTY uncommitted change(s) detected. Commit everything before running CI."
+            exit 1
+          fi
+
+      - name: Commit bumped VERSION back
+        # Only push back on main so feature branches don't race
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git diff --cached --quiet || git commit -m "chore: bump version to ${{ steps.semver.outputs.version }} [skip ci]"
+          git push
+
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    needs: version
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build binary
+        run: |
+          go build -ldflags "-X main.version=${{ needs.version.outputs.version }}" \
+            -o dist/myapp ./cmd/myapp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: myapp-${{ needs.version.outputs.version }}
+          path: dist/
+
+  docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    # Only push images on main; PRs just build to validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.short_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            APP_VERSION=${{ needs.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

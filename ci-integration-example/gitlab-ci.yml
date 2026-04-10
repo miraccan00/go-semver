@@ -1,0 +1,142 @@
+# GitLab CI/CD — go-semver integration example
+#
+# Prerequisites:
+#   - Set GIT_DEPTH: "0" here or in Settings > CI/CD > Variables
+#     so go-semver can read the full commit history.
+#   - Add REGISTRY_USER and REGISTRY_PASS to CI/CD variables
+#     (or use the built-in $CI_REGISTRY_* variables for GitLab Registry).
+
+# Prevent recursive pipeline runs when only VERSION is committed back.
+# The rule below cancels the entire pipeline if the only changed file is VERSION.
+workflow:
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip ci\]/
+      when: never
+    - changes:
+        - VERSION
+      when: never
+    - when: always
+
+variables:
+  GIT_DEPTH: "0"                            # REQUIRED — full history for go-semver
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE: $CI_REGISTRY_IMAGE
+
+stages:
+  - version
+  - test
+  - build
+  - publish
+
+# ── Stage: version ────────────────────────────────────────────────────────────
+semver:
+  stage: version
+  image: ghcr.io/miraccan00/go-semver:latest
+  script:
+    - VERSION_JSON=$(new-semver)
+    - echo "$VERSION_JSON"
+
+    # Fail fast on dirty workspace
+    - |
+      DIRTY=$(echo "$VERSION_JSON" | jq '.UncommittedChanges')
+      if [ "$DIRTY" -gt "0" ]; then
+        echo "ERROR: $DIRTY uncommitted change(s) detected."
+        exit 1
+      fi
+
+    # Export variables for downstream jobs via dotenv artifact
+    - echo "APP_VERSION=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')"          >> build.env
+    - echo "FULL_SEMVER=$(echo $VERSION_JSON | jq -r '.FullSemVer')"               >> build.env
+    - echo "SHORT_SHA=$(echo $VERSION_JSON | jq -r '.ShortSha')"                   >> build.env
+    - echo "BRANCH_NAME=$(echo $VERSION_JSON | jq -r '.EscapedBranchName')"        >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env     # APP_VERSION etc. are injected into all downstream jobs
+    expire_in: 1 day
+
+# ── Stage: test ───────────────────────────────────────────────────────────────
+unit-tests:
+  stage: test
+  image: golang:1.22-alpine
+  needs: []                 # can run in parallel with semver
+  script:
+    - go test ./...
+
+# ── Stage: build ──────────────────────────────────────────────────────────────
+build-binary:
+  stage: build
+  image: golang:1.22-alpine
+  needs: [semver]           # APP_VERSION injected via dotenv
+  script:
+    - echo "Building version $APP_VERSION (commit $SHORT_SHA)"
+    - |
+      go build \
+        -ldflags "-X main.version=$APP_VERSION -X main.commit=$SHORT_SHA" \
+        -o dist/myapp \
+        ./cmd/myapp
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 day
+
+build-docker:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  needs: [semver]
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+    - |
+      docker build \
+        --build-arg APP_VERSION=$APP_VERSION \
+        --tag $IMAGE:$APP_VERSION \
+        --tag $IMAGE:$SHORT_SHA \
+        --tag $IMAGE:$BRANCH_NAME \
+        .
+    # Save image tar for the publish stage (avoids rebuilding)
+    - docker save $IMAGE:$APP_VERSION | gzip > image.tar.gz
+  artifacts:
+    paths:
+      - image.tar.gz
+    expire_in: 1 day
+
+# ── Stage: publish ────────────────────────────────────────────────────────────
+push-docker:
+  stage: publish
+  image: docker:24
+  services:
+    - docker:24-dind
+  needs: [build-docker, semver]
+  only:
+    - main
+    - /^release\/.*/
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+    - docker load < image.tar.gz
+    - docker push $IMAGE:$APP_VERSION
+    - docker push $IMAGE:$SHORT_SHA
+    - docker push $IMAGE:$BRANCH_NAME
+    # Tag :latest only on main
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag $IMAGE:$APP_VERSION $IMAGE:latest
+        docker push $IMAGE:latest
+      fi
+
+commit-version:
+  stage: publish
+  image: alpine/git:latest
+  needs: [semver]
+  only:
+    - main
+  script:
+    - git config user.name  "gitlab-ci[bot]"
+    - git config user.email "gitlab-ci[bot]@noreply.example.com"
+    - git remote set-url origin "https://oauth2:$CI_PUSH_TOKEN@$CI_SERVER_HOST/$CI_PROJECT_PATH.git"
+    - git add VERSION
+    - git diff --cached --quiet || git commit -m "chore: bump version to $APP_VERSION [skip ci]"
+    - git push origin HEAD:$CI_COMMIT_BRANCH
+  # CI_PUSH_TOKEN: a project access token with write_repository scope,
+  # added in Settings > CI/CD > Variables.

@@ -80,6 +80,172 @@ next-version: 0.0.1       # used when VERSION file is absent
 mode: ContinuousDeployment
 ```
 
+## Docker
+
+Pre-built images are published to GitHub Container Registry on every push to `main`:
+
+```bash
+docker pull ghcr.io/miraccan00/go-semver:latest
+```
+
+Run it against your local repository:
+
+```bash
+docker run --rm \
+  -v $(pwd):/workspace \
+  -w /workspace \
+  ghcr.io/miraccan00/go-semver:latest
+```
+
+> The container has `git` installed. Mount your repo root to `/workspace` so the tool can read `.git/`, `VERSION`, and `GitVersion.yml`.
+
+---
+
+## CI/CD Integration
+
+### Quick Start (any CI)
+
+Add a `VERSION` file to your repo root so versions persist between pipeline runs:
+
+```bash
+echo "0.1.0" > VERSION
+git add VERSION
+git commit -m "chore: add initial VERSION file"
+```
+
+Then run go-semver at the start of your pipeline to bump the version and capture the output:
+
+```bash
+VERSION_JSON=$(docker run --rm -v $(pwd):/workspace -w /workspace \
+  ghcr.io/miraccan00/go-semver:latest)
+
+# Extract the version string
+APP_VERSION=$(echo "$VERSION_JSON" | jq -r '.MajorMinorPatch')
+echo "Building version: $APP_VERSION"
+```
+
+---
+
+### GitHub Actions
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # required — go-semver reads git log
+
+      - name: Run go-semver
+        id: semver
+        run: |
+          VERSION_JSON=$(docker run --rm -v $(pwd):/workspace -w /workspace \
+            ghcr.io/miraccan00/go-semver:latest)
+          echo "json=$VERSION_JSON" >> $GITHUB_OUTPUT
+          echo "version=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')" >> $GITHUB_OUTPUT
+
+      - name: Use version
+        run: |
+          echo "App version: ${{ steps.semver.outputs.version }}"
+          docker build -t myapp:${{ steps.semver.outputs.version }} .
+```
+
+> **Important:** Use `fetch-depth: 0` — the default shallow clone breaks `git log` and commit counting.
+
+---
+
+### GitLab CI
+
+```yaml
+variables:
+  DOCKER_DRIVER: overlay2
+
+semver:
+  image: ghcr.io/miraccan00/go-semver:latest
+  stage: .pre
+  script:
+    - VERSION_JSON=$(new-semver)
+    - echo "APP_VERSION=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')" >> build.env
+    - echo "SHORT_SHA=$(echo $VERSION_JSON | jq -r '.ShortSha')" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env   # makes APP_VERSION available in downstream jobs
+
+build:
+  stage: build
+  needs: [semver]
+  script:
+    - docker build -t myapp:$APP_VERSION .
+```
+
+> **Important:** Set `GIT_DEPTH: 0` in your GitLab project's CI/CD variables or add it to the job to ensure full git history is available.
+
+```yaml
+variables:
+  GIT_DEPTH: 0
+```
+
+---
+
+### Jenkins (Declarative Pipeline)
+
+```groovy
+pipeline {
+    agent any
+    stages {
+        stage('Version') {
+            steps {
+                script {
+                    def versionJson = sh(
+                        script: '''docker run --rm \
+                            -v $(pwd):/workspace -w /workspace \
+                            ghcr.io/miraccan00/go-semver:latest''',
+                        returnStdout: true
+                    ).trim()
+                    env.APP_VERSION = sh(
+                        script: "echo '${versionJson}' | jq -r '.MajorMinorPatch'",
+                        returnStdout: true
+                    ).trim()
+                    echo "Building version: ${env.APP_VERSION}"
+                }
+            }
+        }
+        stage('Build') {
+            steps {
+                sh "docker build -t myapp:${env.APP_VERSION} ."
+            }
+        }
+    }
+}
+```
+
+---
+
+### Available JSON Fields for CI
+
+| Field | Example | Common Use |
+|---|---|---|
+| `MajorMinorPatch` | `1.3.0` | Docker image tag, artifact name |
+| `FullSemVer` | `1.3.0+42` | Build metadata |
+| `ShortSha` | `abc1234` | Traceability tag |
+| `BranchName` | `main` | Conditional logic per branch |
+| `EscapedBranchName` | `feature-login` | Safe for use in image tags |
+| `CommitDate` | `2026-04-10` | Release notes |
+| `UncommittedChanges` | `0` | Guard: fail build if dirty |
+
+Fail the pipeline if there are uncommitted changes:
+
+```bash
+DIRTY=$(echo "$VERSION_JSON" | jq '.UncommittedChanges')
+if [ "$DIRTY" -gt 0 ]; then
+  echo "ERROR: $DIRTY uncommitted changes detected. Commit before building."
+  exit 1
+fi
+```
+
+---
+
 ## Known Limitations / Edge Cases
 
 These scenarios are **not fully handled** — keep them in mind when integrating into CI/CD:

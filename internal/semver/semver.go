@@ -10,8 +10,6 @@ import (
 	"strings"
 )
 
-const versionFile = "VERSION"
-
 type SemVer struct {
 	Major int
 	Minor int
@@ -51,34 +49,6 @@ func CheckGitRepoExists() bool {
 	return err == nil && info.IsDir()
 }
 
-func ReadVersionFromFile(file string) (SemVer, error) {
-	data, err := ioutil.ReadFile(file)
-	if err != nil {
-		return SemVer{}, err
-	}
-	parts := strings.Split(strings.TrimSpace(string(data)), ".")
-	if len(parts) != 3 {
-		return SemVer{}, fmt.Errorf("invalid version format")
-	}
-	major, _ := strconv.Atoi(parts[0])
-	minor, _ := strconv.Atoi(parts[1])
-	patch, _ := strconv.Atoi(parts[2])
-	return SemVer{major, minor, patch}, nil
-}
-
-func ReadVersion() (SemVer, error) {
-	return ReadVersionFromFile(versionFile)
-}
-
-func WriteVersionToFile(file string, v SemVer) error {
-	versionStr := fmt.Sprintf("%d.%d.%d\n", v.Major, v.Minor, v.Patch)
-	return ioutil.WriteFile(file, []byte(versionStr), 0644)
-}
-
-func WriteVersion(v SemVer) error {
-	return WriteVersionToFile(versionFile, v)
-}
-
 func ParseVersion(s string) (SemVer, error) {
 	parts := strings.Split(strings.TrimSpace(s), ".")
 	if len(parts) != 3 {
@@ -90,39 +60,85 @@ func ParseVersion(s string) (SemVer, error) {
 	return SemVer{major, minor, patch}, nil
 }
 
-func GetLastCommitMessage() (string, error) {
-	cmd := exec.Command("git", "log", "-1", "--pretty=%B")
+// ParseTagVersion strips an optional "v" prefix before parsing.
+func ParseTagVersion(tag string) (SemVer, error) {
+	return ParseVersion(strings.TrimPrefix(tag, "v"))
+}
+
+// GetLatestSemverTag returns the most recent git tag that looks like a semver
+// (with or without a "v" prefix). Returns an error when no such tag exists.
+func GetLatestSemverTag() (string, error) {
+	// v-prefixed: v1.2.3
+	cmd := exec.Command("git", "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*.[0-9]*.[0-9]*")
 	out, err := cmd.Output()
-	if err != nil {
-		return "", err
+	if err == nil {
+		return strings.TrimSpace(string(out)), nil
 	}
-	return strings.TrimSpace(string(out)), nil
+	// bare: 1.2.3
+	cmd = exec.Command("git", "describe", "--tags", "--abbrev=0", "--match", "[0-9]*.[0-9]*.[0-9]*")
+	out, err = cmd.Output()
+	if err == nil {
+		return strings.TrimSpace(string(out)), nil
+	}
+	return "", fmt.Errorf("no semver tag found")
 }
 
-func BumpByCommitMessage(v *SemVer, msg string) {
-	msg = strings.ToLower(msg)
-	if strings.Contains(msg, "breaking change") || strings.HasPrefix(msg, "feat!:") || strings.HasPrefix(msg, "fix!:") {
+// GetCommitMessagesSinceTag returns the subject line of every commit reachable
+// from HEAD but not from tag. Pass an empty tag to get all commits.
+func GetCommitMessagesSinceTag(tag string) ([]string, error) {
+	var args []string
+	if tag == "" {
+		args = []string{"log", "--pretty=%s"}
+	} else {
+		args = []string{"log", tag + "..HEAD", "--pretty=%s"}
+	}
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return nil, err
+	}
+	var msgs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			msgs = append(msgs, line)
+		}
+	}
+	return msgs, nil
+}
+
+// BumpByCommits applies the highest conventional-commit bump found across all
+// messages: BREAKING CHANGE / feat! / fix! → major, feat → minor, fix → patch.
+func BumpByCommits(v *SemVer, messages []string) {
+	level := 0 // 0=none, 1=patch, 2=minor, 3=major
+	for _, msg := range messages {
+		lower := strings.ToLower(msg)
+		if strings.Contains(lower, "breaking change") ||
+			strings.HasPrefix(lower, "feat!:") ||
+			strings.HasPrefix(lower, "fix!:") {
+			level = 3
+			break // can't go higher
+		} else if strings.HasPrefix(lower, "feat:") && level < 2 {
+			level = 2
+		} else if strings.HasPrefix(lower, "fix:") && level < 1 {
+			level = 1
+		}
+	}
+	switch level {
+	case 3:
 		v.BumpMajor()
-	} else if strings.HasPrefix(msg, "feat:") {
+	case 2:
 		v.BumpMinor()
-	} else if strings.HasPrefix(msg, "fix:") {
+	case 1:
 		v.BumpPatch()
-	} // else: no bump
+	}
 }
 
-func (v *SemVer) BumpMajor() {
-	v.Major++
-	v.Minor = 0
-	v.Patch = 0
-}
+func (v *SemVer) BumpMajor() { v.Major++; v.Minor = 0; v.Patch = 0 }
+func (v *SemVer) BumpMinor() { v.Minor++; v.Patch = 0 }
+func (v *SemVer) BumpPatch() { v.Patch++ }
 
-func (v *SemVer) BumpMinor() {
-	v.Minor++
-	v.Patch = 0
-}
-
-func (v *SemVer) BumpPatch() {
-	v.Patch++
+// BumpByCommitMessage is kept for backwards-compatibility and tests.
+func BumpByCommitMessage(v *SemVer, msg string) {
+	BumpByCommits(v, []string{msg})
 }
 
 func ReadNextVersionFromYML() (string, error) {
@@ -130,8 +146,7 @@ func ReadNextVersionFromYML() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
+	for _, line := range strings.Split(string(data), "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "next-version:") {
 			parts := strings.SplitN(line, ":", 2)
 			if len(parts) == 2 {
@@ -142,41 +157,46 @@ func ReadNextVersionFromYML() (string, error) {
 	return "", fmt.Errorf("next-version not found in GitVersion.yml")
 }
 
+// ReadVersionFromFile and WriteVersionToFile are kept for tests.
+func ReadVersionFromFile(file string) (SemVer, error) {
+	data, err := ioutil.ReadFile(file)
+	if err != nil {
+		return SemVer{}, err
+	}
+	return ParseVersion(strings.TrimSpace(string(data)))
+}
+
+func WriteVersionToFile(file string, v SemVer) error {
+	return ioutil.WriteFile(file, []byte(fmt.Sprintf("%d.%d.%d\n", v.Major, v.Minor, v.Patch)), 0644)
+}
+
 func getCurrentGitBranch() string {
-       cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
-       out, err := cmd.Output()
-       if err != nil {
-	       return ""
-       }
-       return strings.TrimSpace(string(out))
+	out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func getGitInfo() (branch, sha, shortSha, commitDate string, commitsSince int) {
-       branch = getCurrentGitBranch()
-       sha = ""
-       shortSha = ""
-       commitDate = ""
-       commitsSince = 0
-       if branch != "" {
-	       shaBytes, err := exec.Command("git", "rev-parse", "HEAD").Output()
-	       if err == nil {
-		       sha = strings.TrimSpace(string(shaBytes))
-		       if len(sha) > 7 {
-			       shortSha = sha[:7]
-		       } else {
-			       shortSha = sha
-		       }
-	       }
-	       dateBytes, err := exec.Command("git", "log", "-1", "--format=%cd", "--date=short").Output()
-	       if err == nil {
-		       commitDate = strings.TrimSpace(string(dateBytes))
-	       }
-	       countBytes, err := exec.Command("git", "rev-list", "--count", "HEAD").Output()
-	       if err == nil {
-		       commitsSince, _ = strconv.Atoi(strings.TrimSpace(string(countBytes)))
-	       }
-       }
-       return
+	branch = getCurrentGitBranch()
+	if branch != "" {
+		if shaBytes, err := exec.Command("git", "rev-parse", "HEAD").Output(); err == nil {
+			sha = strings.TrimSpace(string(shaBytes))
+			if len(sha) > 7 {
+				shortSha = sha[:7]
+			} else {
+				shortSha = sha
+			}
+		}
+		if dateBytes, err := exec.Command("git", "log", "-1", "--format=%cd", "--date=short").Output(); err == nil {
+			commitDate = strings.TrimSpace(string(dateBytes))
+		}
+		if countBytes, err := exec.Command("git", "rev-list", "--count", "HEAD").Output(); err == nil {
+			commitsSince, _ = strconv.Atoi(strings.TrimSpace(string(countBytes)))
+		}
+	}
+	return
 }
 
 func getUncommittedChanges() int {
@@ -192,38 +212,29 @@ func getUncommittedChanges() int {
 }
 
 func BuildVersionInfo(v SemVer) VersionInfo {
-       branch, sha, shortSha, commitDate, commitsSince := getGitInfo()
-       uncommitted := getUncommittedChanges()
-       majorMinorPatch := fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Patch)
-       semver := majorMinorPatch
-       info := VersionInfo{
-	       Major:                     v.Major,
-	       Minor:                     v.Minor,
-	       Patch:                     v.Patch,
-	       PreReleaseTag:             "",
-	       PreReleaseTagWithDash:     "",
-	       PreReleaseLabel:           "",
-	       PreReleaseLabelWithDash:   "",
-	       PreReleaseNumber:          0,
-	       WeightedPreReleaseNumber:  0,
-	       BuildMetaData:             commitsSince,
-	       FullBuildMetaData:         fmt.Sprintf("%d.Branch.%s.Sha.%s", commitsSince, branch, sha),
-	       MajorMinorPatch:           majorMinorPatch,
-	       SemVer:                    semver,
-	       AssemblySemVer:            majorMinorPatch + ".0",
-	       AssemblySemFileVer:        majorMinorPatch + ".0",
-	       InformationalVersion:      fmt.Sprintf("%s+%d.Branch.%s.Sha.%s", semver, commitsSince, branch, sha),
-	       FullSemVer:                fmt.Sprintf("%s+%d", semver, commitsSince),
-	       BranchName:                branch,
-	       EscapedBranchName:         strings.ReplaceAll(branch, "/", "-"),
-	       Sha:                       sha,
-	       ShortSha:                  shortSha,
-	       VersionSourceSha:          sha,
-	       CommitsSinceVersionSource: commitsSince,
-	       CommitDate:                commitDate,
-	       UncommittedChanges:        uncommitted,
-       }
-       return info
+	branch, sha, shortSha, commitDate, commitsSince := getGitInfo()
+	mmp := fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Patch)
+	return VersionInfo{
+		Major:                     v.Major,
+		Minor:                     v.Minor,
+		Patch:                     v.Patch,
+		BuildMetaData:             commitsSince,
+		FullBuildMetaData:         fmt.Sprintf("%d.Branch.%s.Sha.%s", commitsSince, branch, sha),
+		MajorMinorPatch:           mmp,
+		SemVer:                    mmp,
+		AssemblySemVer:            mmp + ".0",
+		AssemblySemFileVer:        mmp + ".0",
+		InformationalVersion:      fmt.Sprintf("%s+%d.Branch.%s.Sha.%s", mmp, commitsSince, branch, sha),
+		FullSemVer:                fmt.Sprintf("%s+%d", mmp, commitsSince),
+		BranchName:                branch,
+		EscapedBranchName:         strings.ReplaceAll(branch, "/", "-"),
+		Sha:                       sha,
+		ShortSha:                  shortSha,
+		VersionSourceSha:          sha,
+		CommitsSinceVersionSource: commitsSince,
+		CommitDate:                commitDate,
+		UncommittedChanges:        getUncommittedChanges(),
+	}
 }
 
 func PrintJSON(info VersionInfo) {

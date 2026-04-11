@@ -16,18 +16,17 @@ Repo kökünde çalıştırın:
 ./new-semver
 ```
 
-Stdout'a JSON metadata basar ve `VERSION` dosyasını günceller.
+Stdout'a JSON metadata basar. Hiçbir dosya yazılmaz veya değiştirilmez.
 
 ## Versiyon Belirleme Mantığı
 
 ```
-VERSION dosyası var?
-  ├── Evet → dosyadaki versiyonu oku
-  └── Hayır → GitVersion.yml içindeki next-version: alanını kullan
-
-En az bir commit var mı?
-  ├── Evet → son commit mesajını parse et, versiyon artır, VERSION dosyasına yaz
-  └── Hayır → GitVersion.yml'deki next-version ile devam et (bump yok)
+Semver git etiketi var mı? (örn. v1.2.3)
+  ├── Hayır → GitVersion.yml içindeki next-version: değerini olduğu gibi yaz
+  └── Evet  → etiketten bu yana olan commit'leri topla
+                └── Yeni commit var mı?
+                      ├── Hayır → etiket versiyonunu değiştirmeden yaz
+                      └── Evet  → Conventional Commit prefix'lerine göre bump yap
 ```
 
 ### Conventional Commits → Versiyon Artışı
@@ -40,7 +39,18 @@ En az bir commit var mı?
 | `BREAKING CHANGE:` | `BREAKING CHANGE: schema renamed` | MAJOR artışı |
 | Diğerleri (`chore:`, `docs:`, vb.) | `chore: update deps` | Artış yok |
 
-> Eşleştirme büyük/küçük harf duyarsızdır.
+> Eşleştirme büyük/küçük harf duyarsızdır. Birden fazla commit varsa en yüksek bump kazanır.
+
+## Yapılandırma
+
+### GitVersion.yml
+
+İlk git etiketi oluşturulmadan önce versiyon kaynağı olarak kullanılır:
+
+```yaml
+next-version: 0.1.0       # henüz semver etiket yokken kullanılır
+mode: ContinuousDeployment
+```
 
 ## JSON Çıktısı
 
@@ -66,20 +76,6 @@ En az bir commit var mı?
 }
 ```
 
-## Dosyalar
-
-| Dosya | Açıklama |
-|---|---|
-| `VERSION` | `X.Y.Z` formatında aktif versiyon — araç tarafından yönetilir, bu dosyayı commit'leyin |
-| `GitVersion.yml` | `VERSION` dosyası yoksa `next-version:` alanı fallback olarak kullanılır |
-
-### GitVersion.yml
-
-```yaml
-next-version: 0.0.1       # VERSION dosyası yoksa kullanılır
-mode: ContinuousDeployment
-```
-
 ## Docker
 
 `main`'e her push'ta image otomatik olarak GitHub Container Registry'ye yayınlanır:
@@ -97,7 +93,7 @@ docker run --rm \
   ghcr.io/miraccan00/go-semver:latest
 ```
 
-> Container içinde `git` kurulu gelir. Aracın `.git/`, `VERSION` ve `GitVersion.yml` dosyalarını okuyabilmesi için repo kökünüzü `/workspace` olarak mount edin.
+> Container içinde `git` kurulu gelir. Aracın `.git/` ve `GitVersion.yml` dosyalarını okuyabilmesi için repo kökünüzü `/workspace` olarak mount edin.
 
 ---
 
@@ -105,21 +101,12 @@ docker run --rm \
 
 ### Hızlı Başlangıç (tüm CI sistemleri için)
 
-Versiyon pipeline çalışmaları arasında kaybolmasın diye repo kökünüze bir `VERSION` dosyası ekleyin:
-
-```bash
-echo "0.1.0" > VERSION
-git add VERSION
-git commit -m "chore: add initial VERSION file"
-```
-
-Ardından pipeline'ın başında go-semver'ı çalıştırarak versiyonu artırın ve çıktıyı yakalayın:
+Git geçmişinin tam alındığından (`--depth 0`) emin olun ve versiyonu yakalamak için go-semver'ı çalıştırın:
 
 ```bash
 VERSION_JSON=$(docker run --rm -v $(pwd):/workspace -w /workspace \
   ghcr.io/miraccan00/go-semver:latest)
 
-# Versiyon string'ini ayıkla
 APP_VERSION=$(echo "$VERSION_JSON" | jq -r '.MajorMinorPatch')
 echo "Derlenen versiyon: $APP_VERSION"
 ```
@@ -135,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # zorunlu — go-semver git log'u okur
+          fetch-depth: 0          # zorunlu — go-semver tam git log'u okur
 
       - name: go-semver çalıştır
         id: semver
@@ -159,7 +146,7 @@ jobs:
 
 ```yaml
 variables:
-  DOCKER_DRIVER: overlay2
+  GIT_DEPTH: 0              # zorunlu — tam git geçmişini sağlar
 
 semver:
   image: ghcr.io/miraccan00/go-semver:latest
@@ -170,20 +157,13 @@ semver:
     - echo "SHORT_SHA=$(echo $VERSION_JSON | jq -r '.ShortSha')" >> build.env
   artifacts:
     reports:
-      dotenv: build.env   # APP_VERSION'ı sonraki job'lara aktarır
+      dotenv: build.env     # APP_VERSION'ı sonraki job'lara aktarır
 
 build:
   stage: build
   needs: [semver]
   script:
     - docker build -t myapp:$APP_VERSION .
-```
-
-> **Önemli:** GitLab projenizin CI/CD değişkenlerine `GIT_DEPTH: 0` ekleyin ya da job içine yazın; aksi halde tam git geçmişi alınamaz.
-
-```yaml
-variables:
-  GIT_DEPTH: 0
 ```
 
 ---
@@ -248,13 +228,10 @@ fi
 
 ## Bilinen Kısıtlamalar / Edge Case'ler
 
-Aşağıdaki durumlar şu an **tam desteklenmiyor** — CI/CD entegrasyonunda dikkat edilmeli:
-
 | Durum | Mevcut Davranış |
 |---|---|
 | Detached HEAD (CI checkout) | `BranchName` boş string döner, hata yok |
 | Pre-release versiyonlar (`1.0.0-rc.1`) | `VersionInfo` alanları var ama doldurulmaz |
-| Geçersiz VERSION içeriği (`abc`) | `strconv.Atoi` hatayı yutarak `0` döner |
 | Merge commit mesajları | Conventional prefix yoksa bump olmaz |
 | Çoklu bump kuralı (aynı commit) | İlk eşleşen kazanır: major → minor → patch |
 | `git` binary bulunamadı | Git alanları sıfır döner, hata fırlatılmaz |
@@ -266,7 +243,7 @@ Aşağıdaki durumlar şu an **tam desteklenmiyor** — CI/CD entegrasyonunda di
 go test ./internal/semver/...
 ```
 
-Mevcut kapsam: dosya okuma/yazma round-trip, `ParseVersion`, `BumpByCommitMessage` (6 senaryo).
+Mevcut kapsam: `ParseVersion`, `BumpByCommitMessage` (6 senaryo).
 
 ## Proje Yapısı
 
@@ -274,8 +251,7 @@ Mevcut kapsam: dosya okuma/yazma round-trip, `ParseVersion`, `BumpByCommitMessag
 cmd/new-semver/main.go          # CLI giriş noktası
 internal/semver/semver.go       # Core kütüphane
 internal/semver/semver_test.go  # Unit testler
-GitVersion.yml                  # Fallback konfigürasyon
-VERSION                         # Aktif versiyon dosyası (gitignore'a eklemeyin)
+GitVersion.yml                  # Git etiketi yokken kullanılan fallback versiyon
 ```
 
 ## Katkıda Bulunma

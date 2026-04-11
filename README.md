@@ -16,18 +16,17 @@ Run from the root of your Git repository:
 ./new-semver
 ```
 
-Prints a JSON metadata object to stdout and updates the `VERSION` file in place.
+Prints a JSON metadata object to stdout. No files are written or modified.
 
 ## How Version Resolution Works
 
 ```
-Is there a VERSION file?
-  ├── Yes → read version from file
-  └── No  → fall back to next-version: in GitVersion.yml
-
-Is there at least one commit?
-  ├── Yes → parse last commit message, bump version, write VERSION
-  └── No  → use GitVersion.yml next-version as-is (no bump)
+Is there a semver git tag (e.g. v1.2.3)?
+  ├── No  → read next-version: from GitVersion.yml and output as-is
+  └── Yes → collect commits since that tag
+              └── Any new commits?
+                    ├── No  → output the tag version unchanged
+                    └── Yes → bump based on Conventional Commit prefixes
 ```
 
 ### Conventional Commits → Version Bump
@@ -40,7 +39,18 @@ Is there at least one commit?
 | `BREAKING CHANGE:` | `BREAKING CHANGE: schema renamed` | MAJOR bump |
 | Anything else (`chore:`, `docs:`, etc.) | `chore: update deps` | No bump |
 
-> Matching is case-insensitive.
+> Matching is case-insensitive. When multiple commits are present, the highest bump wins.
+
+## Configuration
+
+### GitVersion.yml
+
+Used as the version source before the first git tag is created:
+
+```yaml
+next-version: 0.1.0       # output when no semver tag exists yet
+mode: ContinuousDeployment
+```
 
 ## JSON Output
 
@@ -66,20 +76,6 @@ Is there at least one commit?
 }
 ```
 
-## Files
-
-| File | Description |
-|---|---|
-| `VERSION` | Active version in `X.Y.Z` format — managed by the tool, commit this file |
-| `GitVersion.yml` | Provides the `next-version:` fallback when `VERSION` doesn't exist |
-
-### GitVersion.yml
-
-```yaml
-next-version: 0.0.1       # used when VERSION file is absent
-mode: ContinuousDeployment
-```
-
 ## Docker
 
 Pre-built images are published to GitHub Container Registry on every push to `main`:
@@ -97,7 +93,7 @@ docker run --rm \
   ghcr.io/miraccan00/go-semver:latest
 ```
 
-> The container has `git` installed. Mount your repo root to `/workspace` so the tool can read `.git/`, `VERSION`, and `GitVersion.yml`.
+> The container has `git` installed. Mount your repo root to `/workspace` so the tool can read `.git/` and `GitVersion.yml`.
 
 ---
 
@@ -105,21 +101,12 @@ docker run --rm \
 
 ### Quick Start (any CI)
 
-Add a `VERSION` file to your repo root so versions persist between pipeline runs:
-
-```bash
-echo "0.1.0" > VERSION
-git add VERSION
-git commit -m "chore: add initial VERSION file"
-```
-
-Then run go-semver at the start of your pipeline to bump the version and capture the output:
+Ensure the full git history is fetched (`--depth 0`) and run go-semver to capture the version:
 
 ```bash
 VERSION_JSON=$(docker run --rm -v $(pwd):/workspace -w /workspace \
   ghcr.io/miraccan00/go-semver:latest)
 
-# Extract the version string
 APP_VERSION=$(echo "$VERSION_JSON" | jq -r '.MajorMinorPatch')
 echo "Building version: $APP_VERSION"
 ```
@@ -135,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # required — go-semver reads git log
+          fetch-depth: 0          # required — go-semver reads full git log
 
       - name: Run go-semver
         id: semver
@@ -159,7 +146,7 @@ jobs:
 
 ```yaml
 variables:
-  DOCKER_DRIVER: overlay2
+  GIT_DEPTH: 0              # required — ensures full git history
 
 semver:
   image: ghcr.io/miraccan00/go-semver:latest
@@ -170,20 +157,13 @@ semver:
     - echo "SHORT_SHA=$(echo $VERSION_JSON | jq -r '.ShortSha')" >> build.env
   artifacts:
     reports:
-      dotenv: build.env   # makes APP_VERSION available in downstream jobs
+      dotenv: build.env     # makes APP_VERSION available in downstream jobs
 
 build:
   stage: build
   needs: [semver]
   script:
     - docker build -t myapp:$APP_VERSION .
-```
-
-> **Important:** Set `GIT_DEPTH: 0` in your GitLab project's CI/CD variables or add it to the job to ensure full git history is available.
-
-```yaml
-variables:
-  GIT_DEPTH: 0
 ```
 
 ---
@@ -248,13 +228,10 @@ fi
 
 ## Known Limitations / Edge Cases
 
-These scenarios are **not fully handled** — keep them in mind when integrating into CI/CD:
-
 | Scenario | Current Behavior |
 |---|---|
 | Detached HEAD (typical CI checkout) | `BranchName` is empty string, no error raised |
 | Pre-release versions (`1.0.0-rc.1`) | Fields exist in `VersionInfo` but are never populated |
-| Malformed `VERSION` content (e.g. `abc`) | `strconv.Atoi` silently returns `0` |
 | Merge commit messages | No conventional prefix → no bump |
 | Multiple bump rules in one commit | First match wins: major → minor → patch |
 | `git` binary not found | Git fields return zero values, no error |
@@ -266,7 +243,7 @@ These scenarios are **not fully handled** — keep them in mind when integrating
 go test ./internal/semver/...
 ```
 
-Current coverage: file read/write round-trip, `ParseVersion`, `BumpByCommitMessage` (6 scenarios).
+Current coverage: `ParseVersion`, `BumpByCommitMessage` (6 scenarios).
 
 ## Project Structure
 
@@ -274,8 +251,7 @@ Current coverage: file read/write round-trip, `ParseVersion`, `BumpByCommitMessa
 cmd/new-semver/main.go          # CLI entry point
 internal/semver/semver.go       # Core library
 internal/semver/semver_test.go  # Unit tests
-GitVersion.yml                  # Fallback configuration
-VERSION                         # Active version file (do not gitignore)
+GitVersion.yml                  # Fallback version when no git tag exists
 ```
 
 ## Contributing

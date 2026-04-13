@@ -107,7 +107,7 @@ func checkoutBranch(t *testing.T, repo *git.Repository, name string) {
 	}
 }
 
-// ── Scenario 1: Fresh repo — no tags ─────────────────────────────────────────
+// ── Scenario 1a: Fresh repo — no tags ────────────────────────────────────────
 
 // TestScenario_FreshRepo verifies that a brand-new repo without any semver tag
 // causes GetLatestSemverTag to return an error, which is the signal for the
@@ -122,6 +122,50 @@ func TestScenario_FreshRepo(t *testing.T) {
 	// Assert
 	if err == nil {
 		t.Error("expected error for repo with no semver tag, got nil")
+	}
+}
+
+// ── Scenario 1b: Fresh repo — no tags — mainline merge creates initial tag ───
+
+// TestScenario_FreshRepoMainlineMergeCreatesInitialTag replicates the no-tag
+// path in cmd/semver/main.go: when SOURCE_BRANCH indicates a mainline merge and
+// no semver tag exists yet, the tool creates the initial tag from next-version
+// (1.0.0 in GitVersion.yml) so subsequent runs have a baseline to diff against.
+func TestScenario_FreshRepoMainlineMergeCreatesInitialTag(t *testing.T) {
+	// Arrange
+	repo, dir := scenarioRepo(t)
+	addCommit(t, repo, dir, "init.txt", "initial commit")
+	t.Setenv("MAINLINE_BRANCH", "master")
+	t.Setenv("SOURCE_BRANCH", "develop")
+
+	// Confirm no semver tag exists yet (mirrors the tagErr != nil branch in main.go)
+	_, _, tagErr := GetLatestSemverTag(repo)
+	if tagErr == nil {
+		t.Fatal("precondition failed: expected no semver tag on fresh repo")
+	}
+
+	// Replicate the main.go no-tag + mainline merge logic:
+	// read next-version (1.0.0), check mainline + IsMainlineMerge, create tag.
+	v := SemVer{1, 0, 0} // next-version from GitVersion.yml
+
+	// Act
+	var createErr error
+	if GetCurrentBranch(repo) == GetMainlineBranch() && IsMainlineMerge([]string{}) {
+		createErr = CreateVersionTag(repo, v)
+	} else {
+		t.Fatal("IsMainlineMerge should be true with SOURCE_BRANCH=develop on master")
+	}
+
+	// Assert
+	if createErr != nil {
+		t.Fatalf("CreateVersionTag: %v", createErr)
+	}
+	tagName, _, err := GetLatestSemverTag(repo)
+	if err != nil {
+		t.Fatalf("GetLatestSemverTag after init: %v", err)
+	}
+	if tagName != "v1.0.0" {
+		t.Errorf("expected initial tag v1.0.0, got %q", tagName)
 	}
 }
 

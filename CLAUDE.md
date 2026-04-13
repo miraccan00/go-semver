@@ -9,18 +9,19 @@
 ## Repository layout
 
 ```
-cmd/semver/main.go                  # CLI entry point
-internal/semver/semver.go               # Core library (all logic lives here)
-internal/semver/semver_test.go          # Unit tests
-internal/semver/semver_scenario_test.go # End-to-end branch-flow scenarios
-GitVersion.yml                          # Fallback version config + branch docs
-ci-integration-example/                 # Ready-to-use CI pipeline templates
+cmd/semver/main.go                       # CLI entry point
+internal/semver/semver.go                # Core library (all logic lives here)
+internal/semver/semver_test.go           # Unit tests
+internal/semver/semver_scenario_test.go  # End-to-end branch-flow scenarios
+GitVersion.yml                           # Fallback version config + branch docs
+ci-integration-example/                  # Ready-to-use CI pipeline templates
   github-actions.yml
   gitlab-ci.yml
   azure-pipelines.yml
-.github/workflows/docker-push.yml       # Tool's own CI (builds & pushes Docker image)
-Dockerfile                              # Docker image definition
-go.mod                                  # Module name: semver, Go 1.24.1
+.github/workflows/ci.yml                 # PR validation: tests + build
+.github/workflows/release.yml            # Merge to master: semver tag + Docker push
+Dockerfile                               # Docker image definition
+go.mod                                   # Module name: semver, Go 1.24.1
 ```
 
 No `VERSION` file — that was removed. No `testdata/` directory — tests use `t.TempDir()`.
@@ -50,7 +51,11 @@ A version tag (`vX.Y.Z`) is created automatically when `semver` runs **on the ma
 ```
 1. OpenRepo()                         — open .git in cwd
 2. GetLatestSemverTag(repo)
-   ├── error → ReadNextVersionFromYML() → PrintJSON (no tag yet)
+   ├── error → ReadNextVersionFromYML() → v = next-version (1.0.0)
+   │           GetCurrentBranch == GetMainlineBranch() && IsMainlineMerge([])?
+   │           ├── yes → CreateVersionTag(repo, v)   ← initial tag on first mainline merge
+   │           └── no  → (no tag created)
+   │           PrintJSON
    └── ok    → ParseTagVersion(tag)
 3. GetCommitMessagesSinceTag(repo, tagHash)
    └── empty → PrintJSON (no new commits, current tag is correct)
@@ -185,7 +190,7 @@ Without `SOURCE_BRANCH`, the tool falls back to commit-message pattern detection
 ## GitVersion.yml
 
 Serves two purposes:
-1. **Fallback version** — `next-version: 0.1.0` is used when no semver tag exists yet.
+1. **Fallback version** — `next-version: 1.0.0` is used when no semver tag exists yet. On the first mainline merge (`SOURCE_BRANCH` detected), the tool creates `v1.0.0` automatically so subsequent runs have a baseline.
 2. **Documentation** — contains the branch strategy table and env var docs as comments. It is **not** a runtime config file; only `next-version:` is read by the code (`ReadNextVersionFromYML()`).
 
 ---
@@ -201,7 +206,7 @@ docker run --rm -v $(pwd):/workspace -w /workspace ghcr.io/miraccan00/go-semver:
 
 Mount your repo root to `/workspace`; the container has `git` installed.
 
-The tool's own Docker image is built by `.github/workflows/docker-push.yml` on every push to `main` and on `v*.*.*` tags.
+The tool's own Docker image is built and pushed by [`.github/workflows/release.yml`](.github/workflows/release.yml) on every merge to master. There is no separate docker-push workflow.
 
 ---
 
@@ -261,7 +266,8 @@ synced, err = IsMainlineSynced(repo, "develop", hotfixTip)
 - `TestCreateVersionTag`, `TestCreateVersionTagNoDuplicate`
 
 **`semver_scenario_test.go`** — integration scenarios using real in-process git repos (`git.PlainInit` in a temp dir). Each scenario is independent:
-- Scenario 1: Fresh repo (no tags) → error fallback
+- Scenario 1a: Fresh repo (no tags) → `GetLatestSemverTag` returns error (fallback signal)
+- Scenario 1b: Fresh repo + `SOURCE_BRANCH=develop` on master → `IsMainlineMerge` true → initial `v1.0.0` tag created from `next-version`
 - Scenario 2: Features squash-merged to develop → Minor bump, no auto-tag
 - Scenario 3: Squash develop→main, `feat!:` → Major (v2.0.0), tag created
 - Scenario 4: Hotfix `fix:` → Patch (v1.0.1), `IsMainlineSynced` before/after sync (two act/assert cycles)
@@ -294,8 +300,76 @@ Key dependency: `github.com/go-git/go-git/v5` — pure-Go git implementation use
 
 **Debug version output** — run `./semver` from the repo root; it prints JSON to stdout. Set `SOURCE_BRANCH`, `MAINLINE_BRANCH`, or `DEVELOP_BRANCH` env vars as needed to simulate CI conditions.
 
-**Important design decisions (do not revert)**:
+---
+
+## GitHub repository setup (one-time)
+
+### Branch protection rules
+
+Configure via **Settings → Branches → Add rule** in the GitHub UI, or with `gh`:
+
+```bash
+# Protect master: require PR, require CI to pass, no direct push
+gh api repos/{owner}/go-semver/branches/master/protection \
+  --method PUT \
+  --input - <<'EOF'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": ["test"]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 1,
+    "dismiss_stale_reviews": true
+  },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+EOF
+
+# Protect develop: require PR, require CI to pass
+gh api repos/{owner}/go-semver/branches/develop/protection \
+  --method PUT \
+  --input - <<'EOF'
+{
+  "required_status_checks": {
+    "strict": false,
+    "contexts": ["test"]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 1
+  },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+EOF
+```
+
+### GitFlow — branching rules
+
+```
+master     ← PRs only from: develop, release/*, hotfix/*
+develop    ← PRs only from: feature/*
+feature/*  ← branch from develop; delete after merge
+release/*  ← branch from develop; merge to master AND back to develop
+hotfix/*   ← branch from master; merge to master AND back to develop
+```
+
+**Workflow triggered on PR merge to master** (`release.yml`):
+1. `SOURCE_BRANCH` is read from `github.event.pull_request.head.ref` — no commit-message parsing needed, works with both merge and squash strategies.
+2. Semver container (`ghcr.io/miraccan00/go-semver:latest`) runs in the workspace with `MAINLINE_BRANCH=master` and the detected `SOURCE_BRANCH`.
+3. If `IsMainlineMerge` returns true, the tool bumps the version, creates the tag in `.git`, and the workflow pushes it.
+4. Docker image is built and pushed as `ghcr.io/miraccan00/go-semver:<version>` and `:latest`.
+
+---
+
+## Important design decisions (do not revert)
 - `hasBreakingChangeFooter` uses `HasPrefix` (not `Contains`) to avoid matching body prose like "no breaking change" — this was a deliberate fix for a test regression.
 - `GetCommitMessagesSinceTag` returns **full** messages (not just subject lines) — required so footer tokens are detectable.
 - `IsMainlineMerge` is purely a detection function; it does **not** apply a bump. Bump is always `BumpByCommits`.
 - There is no `BumpForMainlineMerge` function — it was removed when source-branch-based bumping was replaced with commit-driven bumping.
+- `release.yml` uses `pull_request: types: [closed]` (not `push: branches: [master]`) so that `github.event.pull_request.head.ref` is available for `SOURCE_BRANCH` detection — avoids fragile commit-message parsing for GitHub-style merge commits ("Merge pull request #N from owner/branch").

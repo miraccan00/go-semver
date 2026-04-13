@@ -17,8 +17,10 @@ func main() {
 	tag, tagHash, tagErr := semver.GetLatestSemverTag(repo)
 
 	// ── No tag found ──────────────────────────────────────────────────────────
-	// Before the first release. Output next-version from GitVersion.yml as-is;
-	// the CI pipeline is expected to create the first tag (e.g. v1.0.0).
+	// Before the first release. Read next-version from GitVersion.yml.
+	// On mainline with a recognised merge, create the initial tag so subsequent
+	// runs have a baseline to diff against. IsMainlineMerge checks SOURCE_BRANCH
+	// first — no commit messages are needed for the squash-merge CI path.
 	if tagErr != nil {
 		nextVer, err := semver.ReadNextVersionFromYML()
 		if err != nil {
@@ -29,6 +31,11 @@ func main() {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "invalid next-version in GitVersion.yml:", err)
 			os.Exit(1)
+		}
+		if semver.GetCurrentBranch(repo) == semver.GetMainlineBranch() && semver.IsMainlineMerge([]string{}) {
+			if err := semver.CreateVersionTag(repo, v); err != nil {
+				fmt.Fprintln(os.Stderr, "warning: could not create initial tag:", err)
+			}
 		}
 		semver.PrintJSON(semver.BuildVersionInfo(repo, v))
 		return

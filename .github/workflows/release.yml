@@ -1,0 +1,92 @@
+name: Release
+
+# Fires when a PR is merged into master.
+# SOURCE_BRANCH is taken directly from the PR event — no commit-message parsing needed.
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+
+permissions:
+  contents: write   # create & push git tags
+  packages: write   # push to GHCR
+
+jobs:
+  release:
+    # Only run on actual merges, not on PR close-without-merge.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0   # full history so semver can walk tags
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Run the semver container against the mounted workspace.
+      # --user ensures the container writes tag refs as the runner's UID so git
+      # operations after this step can see and push the new tag.
+      # SOURCE_BRANCH comes from the merged PR — works for both merge and squash
+      # strategies without any commit-message parsing.
+      - name: Compute semver version
+        id: semver
+        env:
+          SOURCE_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          TAGS_BEFORE=$(git tag --sort=-v:refname | head -1)
+
+          VERSION_JSON=$(docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e MAINLINE_BRANCH=master \
+            -e SOURCE_BRANCH="${{ github.event.pull_request.head.ref }}" \
+            ghcr.io/miraccan00/go-semver:latest)
+
+          echo "$VERSION_JSON"
+
+          TAGS_AFTER=$(git tag --sort=-v:refname | head -1)
+          VERSION=$(echo "$VERSION_JSON" | jq -r '.SemVer')
+
+          echo "version=$VERSION"          >> "$GITHUB_OUTPUT"
+          echo "escaped_branch=$(echo "$VERSION_JSON" | jq -r '.EscapedBranchName')" >> "$GITHUB_OUTPUT"
+
+          if [ "$TAGS_BEFORE" != "$TAGS_AFTER" ]; then
+            echo "tag_created=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_created=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push semver tag to origin
+        if: steps.semver.outputs.tag_created == 'true'
+        run: git push origin "v${{ steps.semver.outputs.version }}"
+
+      - name: Build and push Docker image
+        if: steps.semver.outputs.tag_created == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Single platform: eliminates untagged platform-specific sha256 digest
+          # entries in GHCR. This tool runs in GitHub Actions (amd64); arm64 is
+          # not needed as a separate manifest.
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.semver.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

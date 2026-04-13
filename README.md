@@ -307,6 +307,31 @@ ci-integration-example/                      # Ready-to-use CI pipeline template
   azure-pipelines.yml
 ```
 
+## Claude Code Integration
+
+A ready-to-use `CLAUDE.md` template is provided at [`ci-integration-example/CLAUDE.md`](ci-integration-example/CLAUDE.md).
+
+Copy it to the root of **any repository** that adopts go-semver versioning. It gives Claude Code full context on:
+
+- The commit-driven versioning rules and Conventional Commit format
+- Branch strategy (GitFlow: `feature/*` → `develop` → `main`, `release/*`, `hotfix/*`)
+- CI/CD requirements (`fetch-depth: 0`, `SOURCE_BRANCH`, tag-push permissions)
+- Hard rules Claude must follow (never edit a VERSION file, never bump manually, always use CC prefixes)
+
+```bash
+# Copy the template into your repository
+curl -o CLAUDE.md https://raw.githubusercontent.com/miraccan00/go-semver/master/ci-integration-example/CLAUDE.md
+# — or copy manually, then update the "Repository Configuration" section
+```
+
+After adding `CLAUDE.md`, Claude Code will automatically:
+- Write all commit messages with the correct Conventional Commit prefix
+- Warn when a PR contains only non-bumping commits (`chore:`, `docs:`)
+- Warn when a breaking change (`feat!:` / `BREAKING CHANGE:`) will trigger a MAJOR bump
+- Flag missing `fetch-depth: 0` or `SOURCE_BRANCH` in CI configs
+
+---
+
 ## Contributing
 
 Pull requests are welcome. When adding features, please cover edge cases with tests in `internal/semver/semver_test.go` and, for branch-flow behaviour, in `semver_scenario_test.go`.

@@ -6,10 +6,16 @@
 #   - Ensure the agent has Docker available (ubuntu-latest includes it).
 #
 # Squash-merge note:
-#   go-semver auto-detects merge source from "Merge branch '…'" commit messages.
-#   If your project uses squash merges, set SOURCE_BRANCH in the pipeline
-#   variables or pass it to the container via -e SOURCE_BRANCH so the tool
-#   knows which branch was merged and can create the version tag.
+#   go-semver auto-detects merge source from "Merge branch '…'" commit messages
+#   (regular merges). For squash merges, SOURCE_BRANCH must be set so the tool
+#   knows which branch was merged:
+#
+#     SOURCE_BRANCH: $(System.PullRequest.SourceBranch)   ← PR pipelines only
+#
+#   For push triggers on main (post-merge), $(System.PullRequest.SourceBranch)
+#   is empty. go-semver then falls back to commit-message detection (works for
+#   regular merges). For squash-merge push pipelines, pass SOURCE_BRANCH as a
+#   pipeline variable set to the source branch name.
 
 trigger:
   branches:
@@ -39,6 +45,7 @@ stages:
       steps:
         - checkout: self
           fetchDepth: 0             # REQUIRED — full history for go-semver
+          persistCredentials: true  # REQUIRED — allows git push --tags after run
 
         - script: |
             VERSION_JSON=$(docker run --rm \
@@ -69,6 +76,14 @@ stages:
             echo "Version resolved: $APP_VERSION ($FULL_SEMVER)"
           name: semver
           displayName: "Resolve version with go-semver"
+          workingDirectory: $(Build.SourcesDirectory)
+
+        # go-semver writes the tag into the local .git — push it back to origin.
+        # Runs only on branch pipelines (not PRs). persistCredentials above
+        # ensures the agent's git credentials are available for the push.
+        - script: git push --tags
+          displayName: "Push version tag"
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 
 # ── Stage: Test ────────────────────────────────────────────────────────────────
 - stage: Test
@@ -85,7 +100,7 @@ stages:
 
         - task: GoTool@0
           inputs:
-            version: "1.22"
+            version: "1.24"
 
         - script: go test ./...
           displayName: "go test ./..."
@@ -108,7 +123,7 @@ stages:
       steps:
         - task: GoTool@0
           inputs:
-            version: "1.22"
+            version: "1.24"
 
         - script: |
             go build \
@@ -154,8 +169,10 @@ stages:
 # ── Stage: Publish ─────────────────────────────────────────────────────────────
 - stage: Publish
   displayName: "Publish"
-  dependsOn: Build
-  condition: and(succeeded(), in(variables['Build.SourceBranchName'], 'main', 'refs/heads/main'))
+  dependsOn:
+    - Version
+    - Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'main'))
   variables:
     APP_VERSION: $[ stageDependencies.Version.RunGoSemver.outputs['semver.APP_VERSION'] ]
     SHORT_SHA:   $[ stageDependencies.Version.RunGoSemver.outputs['semver.SHORT_SHA'] ]

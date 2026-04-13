@@ -307,6 +307,31 @@ ci-integration-example/                      # Kullanıma hazır CI pipeline şa
   azure-pipelines.yml
 ```
 
+## Claude Code Entegrasyonu
+
+[`ci-integration-example/CLAUDE.md`](ci-integration-example/CLAUDE.md) dosyasında kullanıma hazır bir `CLAUDE.md` şablonu bulunmaktadır.
+
+go-semver versiyonlamayı benimseyen **herhangi bir repoya** kopyalanabilir. Claude Code'a şu konularda tam bağlam sağlar:
+
+- Commit'e dayalı versiyonlama kuralları ve Conventional Commit formatı
+- Branch stratejisi (GitFlow: `feature/*` → `develop` → `main`, `release/*`, `hotfix/*`)
+- CI/CD gereksinimleri (`fetch-depth: 0`, `SOURCE_BRANCH`, tag push izinleri)
+- Claude'un uyması gereken kurallar (VERSION dosyası oluşturma, manuel bump yapma, her zaman CC prefix kullan)
+
+```bash
+# Şablonu reponuza kopyalayın
+curl -o CLAUDE.md https://raw.githubusercontent.com/miraccan00/go-semver/master/ci-integration-example/CLAUDE.md
+# — ya da dosyayı manuel kopyalayıp "Repository Configuration" bölümünü güncelleyin
+```
+
+`CLAUDE.md` eklendikten sonra Claude Code otomatik olarak:
+- Tüm commit mesajlarını doğru Conventional Commit prefix'i ile yazar
+- Yalnızca bump yapmayan commit içeren PR'larda (`chore:`, `docs:`) uyarır
+- Breaking change (`feat!:` / `BREAKING CHANGE:`) içeren PR'larda MAJOR bump olacağını bildirir
+- CI konfigürasyonlarında eksik `fetch-depth: 0` veya `SOURCE_BRANCH` değerlerini işaret eder
+
+---
+
 ## Katkıda Bulunma
 
 Pull request'ler memnuniyetle karşılanır. Yeni özellik eklerken lütfen edge case'leri `internal/semver/semver_test.go` içinde, branch akışı davranışları için ise `semver_scenario_test.go` içinde test edin.

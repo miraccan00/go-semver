@@ -7,14 +7,16 @@
 #     (or use the built-in $CI_REGISTRY_* variables for GitLab Registry).
 #
 # Squash-merge note:
-#   go-semver auto-detects merge source from "Merge branch '…'" commit messages.
-#   If your project uses squash merges, set SOURCE_BRANCH in CI/CD Variables
-#   (or pass it per-job) so the tool can identify which branch was merged:
+#   go-semver auto-detects merge source from "Merge branch '…'" commit messages
+#   (regular merges). For squash merges, SOURCE_BRANCH must be set so the tool
+#   knows which branch was merged:
 #
-#     SOURCE_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+#     SOURCE_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME   ← MR pipelines only
 #
-#   This tells go-semver to create a version tag on mainline and apply the
-#   correct commit-driven bump.
+#   For push pipelines on main (post-merge), $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+#   is empty. In that case, go-semver falls back to commit-message detection
+#   (works for regular merges). For squash merges on push pipelines, set
+#   SOURCE_BRANCH as a protected pipeline variable matching the source branch.
 
 workflow:
   rules:
@@ -39,7 +41,8 @@ semver:
   stage: version
   image: ghcr.io/miraccan00/go-semver:latest
   variables:
-    # Pass the merge-request source branch so go-semver can detect squash merges.
+    # Populated on MR pipelines; empty on push pipelines (falls back to commit
+    # message detection for regular merges).
     SOURCE_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
   script:
     - VERSION_JSON=$(semver)
@@ -58,6 +61,16 @@ semver:
     - echo "FULL_SEMVER=$(echo $VERSION_JSON | jq -r '.FullSemVer')"               >> build.env
     - echo "SHORT_SHA=$(echo $VERSION_JSON | jq -r '.ShortSha')"                   >> build.env
     - echo "BRANCH_NAME=$(echo $VERSION_JSON | jq -r '.EscapedBranchName')"        >> build.env
+
+    # go-semver writes the tag into the local .git — push it back to origin.
+    # CI_JOB_TOKEN has write access to the project repository by default.
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ] || echo "$CI_COMMIT_BRANCH" | grep -qE '^release/'; then
+        git config user.email "ci@gitlab.com"
+        git config user.name "GitLab CI"
+        git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+        git push --tags origin
+      fi
   artifacts:
     reports:
       dotenv: build.env     # APP_VERSION etc. are injected into all downstream jobs
@@ -66,15 +79,15 @@ semver:
 # ── Stage: test ───────────────────────────────────────────────────────────────
 unit-tests:
   stage: test
-  image: golang:1.22-alpine
-  needs: []                 # can run in parallel with semver
+  image: golang:1.24-alpine
+  needs: []                 # runs in parallel with semver
   script:
     - go test ./...
 
 # ── Stage: build ──────────────────────────────────────────────────────────────
 build-binary:
   stage: build
-  image: golang:1.22-alpine
+  image: golang:1.24-alpine
   needs: [semver]           # APP_VERSION injected via dotenv
   script:
     - echo "Building version $APP_VERSION (commit $SHORT_SHA)"
@@ -117,18 +130,18 @@ push-docker:
   services:
     - docker:24-dind
   needs: [build-docker, semver]
-  only:
-    - main
-    - /^release\/.*/
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
   script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
     - docker load < image.tar.gz
     - docker push $IMAGE:$APP_VERSION
     - docker push $IMAGE:$SHORT_SHA
     - docker push $IMAGE:$BRANCH_NAME
-    # Tag :latest only on main
+    # Tag :latest only on the default branch
     - |
-      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
         docker tag $IMAGE:$APP_VERSION $IMAGE:latest
         docker push $IMAGE:latest
       fi

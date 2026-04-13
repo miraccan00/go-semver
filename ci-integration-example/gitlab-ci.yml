@@ -5,15 +5,20 @@
 #     so go-semver can read the full commit history.
 #   - Add REGISTRY_USER and REGISTRY_PASS to CI/CD variables
 #     (or use the built-in $CI_REGISTRY_* variables for GitLab Registry).
+#
+# Squash-merge note:
+#   go-semver auto-detects merge source from "Merge branch '…'" commit messages.
+#   If your project uses squash merges, set SOURCE_BRANCH in CI/CD Variables
+#   (or pass it per-job) so the tool can identify which branch was merged:
+#
+#     SOURCE_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+#
+#   This tells go-semver to create a version tag on mainline and apply the
+#   correct commit-driven bump.
 
-# Prevent recursive pipeline runs when only VERSION is committed back.
-# The rule below cancels the entire pipeline if the only changed file is VERSION.
 workflow:
   rules:
     - if: $CI_COMMIT_MESSAGE =~ /\[skip ci\]/
-      when: never
-    - changes:
-        - VERSION
       when: never
     - when: always
 
@@ -33,6 +38,9 @@ stages:
 semver:
   stage: version
   image: ghcr.io/miraccan00/go-semver:latest
+  variables:
+    # Pass the merge-request source branch so go-semver can detect squash merges.
+    SOURCE_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
   script:
     - VERSION_JSON=$(new-semver)
     - echo "$VERSION_JSON"
@@ -124,19 +132,3 @@ push-docker:
         docker tag $IMAGE:$APP_VERSION $IMAGE:latest
         docker push $IMAGE:latest
       fi
-
-commit-version:
-  stage: publish
-  image: alpine/git:latest
-  needs: [semver]
-  only:
-    - main
-  script:
-    - git config user.name  "gitlab-ci[bot]"
-    - git config user.email "gitlab-ci[bot]@noreply.example.com"
-    - git remote set-url origin "https://oauth2:$CI_PUSH_TOKEN@$CI_SERVER_HOST/$CI_PROJECT_PATH.git"
-    - git add VERSION
-    - git diff --cached --quiet || git commit -m "chore: bump version to $APP_VERSION [skip ci]"
-    - git push origin HEAD:$CI_COMMIT_BRANCH
-  # CI_PUSH_TOKEN: a project access token with write_repository scope,
-  # added in Settings > CI/CD > Variables.

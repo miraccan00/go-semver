@@ -4,15 +4,18 @@
 #   - Add REGISTRY_URL, REGISTRY_USER, REGISTRY_PASS as pipeline variables
 #     (or use an Azure Container Registry service connection).
 #   - Ensure the agent has Docker available (ubuntu-latest includes it).
+#
+# Squash-merge note:
+#   go-semver auto-detects merge source from "Merge branch '…'" commit messages.
+#   If your project uses squash merges, set SOURCE_BRANCH in the pipeline
+#   variables or pass it to the container via -e SOURCE_BRANCH so the tool
+#   knows which branch was merged and can create the version tag.
 
 trigger:
   branches:
     include:
       - main
       - release/*
-  paths:
-    exclude:
-      - VERSION   # prevent loops when the version commit is pushed back
 
 pr:
   branches:
@@ -27,7 +30,7 @@ stages:
 
 # ── Stage: Version ─────────────────────────────────────────────────────────────
 - stage: Version
-  displayName: "Bump Version"
+  displayName: "Resolve Version"
   jobs:
     - job: RunGoSemver
       displayName: "Run go-semver"
@@ -41,6 +44,7 @@ stages:
             VERSION_JSON=$(docker run --rm \
               -v $(Build.SourcesDirectory):/workspace \
               -w /workspace \
+              -e SOURCE_BRANCH=$(System.PullRequest.SourceBranch) \
               ghcr.io/miraccan00/go-semver:latest)
 
             echo "##[debug]$VERSION_JSON"
@@ -180,21 +184,3 @@ stages:
                               $(REGISTRY_URL)/$(IMAGE_NAME):latest
                   docker push $(REGISTRY_URL)/$(IMAGE_NAME):latest
                 displayName: "Push Docker image"
-
-    - job: CommitVersion
-      displayName: "Commit bumped VERSION"
-      pool:
-        vmImage: ubuntu-latest
-      steps:
-        - checkout: self
-          persistCredentials: true
-          fetchDepth: 0
-
-        - script: |
-            git config user.name  "azure-pipelines[bot]"
-            git config user.email "azure-pipelines[bot]@noreply.example.com"
-            git add VERSION
-            git diff --cached --quiet && echo "VERSION unchanged, nothing to commit." && exit 0
-            git commit -m "chore: bump version to $(APP_VERSION) [skip ci]"
-            git push origin HEAD:$(Build.SourceBranchName)
-          displayName: "Push VERSION commit back"

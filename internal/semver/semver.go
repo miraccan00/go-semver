@@ -3,12 +3,56 @@ package semver
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
+
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/storer"
 )
+
+var semverTagRE = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)$`)
+
+// Conventional Commit regexes applied to the first line (subject) of a message.
+// They support an optional scope: feat(scope): and an optional breaking ! marker.
+var (
+	reBreakingType = regexp.MustCompile(`(?i)^(feat|fix)(\([^)]*\))?!:`)
+	reFeat         = regexp.MustCompile(`(?i)^feat(\([^)]*\))?:`)
+	reFix          = regexp.MustCompile(`(?i)^fix(\([^)]*\))?:`)
+)
+
+// GetMainlineBranch returns the name of the production release branch.
+// Reads the MAINLINE_BRANCH environment variable; defaults to "main".
+func GetMainlineBranch() string {
+	if b := os.Getenv("MAINLINE_BRANCH"); b != "" {
+		return b
+	}
+	return "main"
+}
+
+// GetSourceBranch returns the name of the branch being merged into mainline,
+// as declared by the CI system via the SOURCE_BRANCH environment variable.
+// Returns an empty string when not set; the caller falls back to commit-message
+// detection in that case.
+//
+// Set SOURCE_BRANCH in CI whenever a squash merge is used, because squash
+// merges produce a plain commit with no "Merge branch …" message.
+func GetSourceBranch() string {
+	return os.Getenv("SOURCE_BRANCH")
+}
+
+// GetDevelopBranch returns the integration branch name.
+// Reads the DEVELOP_BRANCH environment variable; defaults to "develop".
+// Use this when the integration branch is named differently (e.g. "test").
+func GetDevelopBranch() string {
+	if b := os.Getenv("DEVELOP_BRANCH"); b != "" {
+		return b
+	}
+	return "develop"
+}
 
 type SemVer struct {
 	Major int
@@ -44,9 +88,15 @@ type VersionInfo struct {
 	UncommittedChanges        int    `json:"UncommittedChanges"`
 }
 
+// OpenRepo opens the git repository rooted at the current working directory.
+func OpenRepo() (*git.Repository, error) {
+	return git.PlainOpen(".")
+}
+
+// CheckGitRepoExists returns true when the current directory is inside a git repo.
 func CheckGitRepoExists() bool {
-	info, err := os.Stat(".git")
-	return err == nil && info.IsDir()
+	_, err := git.PlainOpen(".")
+	return err == nil
 }
 
 func ParseVersion(s string) (SemVer, error) {
@@ -65,60 +115,130 @@ func ParseTagVersion(tag string) (SemVer, error) {
 	return ParseVersion(strings.TrimPrefix(tag, "v"))
 }
 
-// GetLatestSemverTag returns the most recent git tag that looks like a semver
-// (with or without a "v" prefix). Returns an error when no such tag exists.
-func GetLatestSemverTag() (string, error) {
-	// v-prefixed: v1.2.3
-	cmd := exec.Command("git", "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*.[0-9]*.[0-9]*")
-	out, err := cmd.Output()
-	if err == nil {
-		return strings.TrimSpace(string(out)), nil
+// GetLatestSemverTag walks the commit graph from HEAD and returns the nearest
+// ancestor tag whose name matches a semver pattern (with or without "v" prefix).
+// It handles both lightweight and annotated tags.
+// Returns the tag name and the commit hash it resolves to.
+func GetLatestSemverTag(repo *git.Repository) (string, plumbing.Hash, error) {
+	// Build commit-hash → tag-name map for all semver tags.
+	tagMap := make(map[plumbing.Hash]string)
+
+	tagIter, err := repo.Tags()
+	if err != nil {
+		return "", plumbing.ZeroHash, fmt.Errorf("listing tags: %w", err)
 	}
-	// bare: 1.2.3
-	cmd = exec.Command("git", "describe", "--tags", "--abbrev=0", "--match", "[0-9]*.[0-9]*.[0-9]*")
-	out, err = cmd.Output()
-	if err == nil {
-		return strings.TrimSpace(string(out)), nil
+	err = tagIter.ForEach(func(ref *plumbing.Reference) error {
+		name := ref.Name().Short()
+		if !semverTagRE.MatchString(name) {
+			return nil
+		}
+		// Annotated tag: ref points to a tag object, resolve to its commit.
+		if tagObj, err := repo.TagObject(ref.Hash()); err == nil {
+			commit, err := tagObj.Commit()
+			if err != nil {
+				return nil
+			}
+			tagMap[commit.Hash] = name
+		} else {
+			// Lightweight tag: ref points directly to a commit.
+			tagMap[ref.Hash()] = name
+		}
+		return nil
+	})
+	if err != nil {
+		return "", plumbing.ZeroHash, err
 	}
-	return "", fmt.Errorf("no semver tag found")
+	if len(tagMap) == 0 {
+		return "", plumbing.ZeroHash, fmt.Errorf("no semver tag found")
+	}
+
+	// Walk from HEAD; the first tagged commit we encounter is the nearest ancestor.
+	head, err := repo.Head()
+	if err != nil {
+		return "", plumbing.ZeroHash, fmt.Errorf("resolving HEAD: %w", err)
+	}
+	logIter, err := repo.Log(&git.LogOptions{From: head.Hash()})
+	if err != nil {
+		return "", plumbing.ZeroHash, err
+	}
+
+	var foundName string
+	var foundHash plumbing.Hash
+	_ = logIter.ForEach(func(c *object.Commit) error {
+		if name, ok := tagMap[c.Hash]; ok {
+			foundName = name
+			foundHash = c.Hash
+			return storer.ErrStop
+		}
+		return nil
+	})
+
+	if foundName == "" {
+		return "", plumbing.ZeroHash, fmt.Errorf("no semver tag found in commit ancestry")
+	}
+	return foundName, foundHash, nil
 }
 
-// GetCommitMessagesSinceTag returns the subject line of every commit reachable
-// from HEAD but not from tag. Pass an empty tag to get all commits.
-func GetCommitMessagesSinceTag(tag string) ([]string, error) {
-	var args []string
-	if tag == "" {
-		args = []string{"log", "--pretty=%s"}
-	} else {
-		args = []string{"log", tag + "..HEAD", "--pretty=%s"}
+// GetCommitMessagesSinceTag returns the full message of every commit reachable
+// from HEAD up to (but not including) the commit at tagHash.
+// Full messages are returned so that multi-line footers (e.g. BREAKING-CHANGE:)
+// can be inspected by BumpByCommits.
+func GetCommitMessagesSinceTag(repo *git.Repository, tagHash plumbing.Hash) ([]string, error) {
+	head, err := repo.Head()
+	if err != nil {
+		return nil, fmt.Errorf("resolving HEAD: %w", err)
 	}
-	out, err := exec.Command("git", args...).Output()
+	logIter, err := repo.Log(&git.LogOptions{From: head.Hash()})
 	if err != nil {
 		return nil, err
 	}
+
 	var msgs []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			msgs = append(msgs, line)
+	err = logIter.ForEach(func(c *object.Commit) error {
+		if c.Hash == tagHash {
+			return storer.ErrStop
+		}
+		msg := strings.TrimSpace(c.Message)
+		if msg != "" {
+			msgs = append(msgs, msg)
+		}
+		return nil
+	})
+	return msgs, err
+}
+
+// hasBreakingChangeFooter returns true when any line in msg starts with
+// "BREAKING CHANGE:" or "BREAKING-CHANGE:" (case-insensitive), which is the
+// Conventional Commits footer token for breaking changes.
+func hasBreakingChangeFooter(msg string) bool {
+	for _, line := range strings.Split(msg, "\n") {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(lower, "breaking change:") ||
+			strings.HasPrefix(lower, "breaking-change:") {
+			return true
 		}
 	}
-	return msgs, nil
+	return false
 }
 
 // BumpByCommits applies the highest conventional-commit bump found across all
-// messages: BREAKING CHANGE / feat! / fix! → major, feat → minor, fix → patch.
+// messages.
+//
+// Bump rules (highest wins, short-circuits on Major):
+//   - Subject line matches feat!: / fix!: (with optional scope) → Major
+//   - Any line in full message starts with "BREAKING CHANGE:" or "BREAKING-CHANGE:" → Major
+//   - Subject line matches feat: (with optional scope) → Minor
+//   - Subject line matches fix: (with optional scope) → Patch
 func BumpByCommits(v *SemVer, messages []string) {
 	level := 0 // 0=none, 1=patch, 2=minor, 3=major
 	for _, msg := range messages {
-		lower := strings.ToLower(msg)
-		if strings.Contains(lower, "breaking change") ||
-			strings.HasPrefix(lower, "feat!:") ||
-			strings.HasPrefix(lower, "fix!:") {
+		subject := strings.SplitN(msg, "\n", 2)[0]
+		if reBreakingType.MatchString(subject) || hasBreakingChangeFooter(msg) {
 			level = 3
 			break // can't go higher
-		} else if strings.HasPrefix(lower, "feat:") && level < 2 {
+		} else if reFeat.MatchString(subject) && level < 2 {
 			level = 2
-		} else if strings.HasPrefix(lower, "fix:") && level < 1 {
+		} else if reFix.MatchString(subject) && level < 1 {
 			level = 1
 		}
 	}
@@ -141,8 +261,124 @@ func BumpByCommitMessage(v *SemVer, msg string) {
 	BumpByCommits(v, []string{msg})
 }
 
+// DetectMergeFromDevelop returns true if any message looks like a merge commit
+// from the integration branch (e.g. "Merge branch 'develop' into 'main'").
+// The branch name matched is controlled by GetDevelopBranch() (DEVELOP_BRANCH env var).
+func DetectMergeFromDevelop(messages []string) bool {
+	devBranch := strings.ToLower(GetDevelopBranch())
+	for _, msg := range messages {
+		lower := strings.ToLower(msg)
+		if strings.Contains(lower, "merge") && strings.Contains(lower, devBranch) {
+			return true
+		}
+	}
+	return false
+}
+
+// DetectMergeFromHotfix returns true if any message looks like a merge commit
+// from a hotfix branch (e.g. "Merge branch 'hotfix/login-fix' into 'main'").
+func DetectMergeFromHotfix(messages []string) bool {
+	for _, msg := range messages {
+		lower := strings.ToLower(msg)
+		if strings.Contains(lower, "merge") && strings.Contains(lower, "hotfix/") {
+			return true
+		}
+	}
+	return false
+}
+
+// DetectMergeFromReleaseBranch returns true if any message looks like a merge
+// commit from a release branch (e.g. "Merge branch 'release/1.2' into 'main'").
+func DetectMergeFromReleaseBranch(messages []string) bool {
+	for _, msg := range messages {
+		lower := strings.ToLower(msg)
+		if strings.Contains(lower, "merge") && strings.Contains(lower, "release/") {
+			return true
+		}
+	}
+	return false
+}
+
+// IsMainlineMerge reports whether a recognised source branch was merged into
+// mainline, using the SOURCE_BRANCH env var (CI squash-merge path) first and
+// falling back to commit-message pattern detection (regular merge path).
+//
+// Recognised source branches: develop (or DEVELOP_BRANCH), release/*, hotfix/*
+//
+// When this returns true the caller should:
+//  1. Apply BumpByCommits to determine the bump level from commit messages.
+//  2. Call CreateVersionTag to record the new version on mainline.
+func IsMainlineMerge(messages []string) bool {
+	src := strings.ToLower(strings.TrimSpace(GetSourceBranch()))
+	if src != "" {
+		switch {
+		case src == strings.ToLower(GetDevelopBranch()),
+			strings.HasPrefix(src, "release/"),
+			strings.HasPrefix(src, "hotfix/"):
+			return true
+		}
+	}
+	return DetectMergeFromDevelop(messages) ||
+		DetectMergeFromReleaseBranch(messages) ||
+		DetectMergeFromHotfix(messages)
+}
+
+// IsMainlineSynced reports whether sourceBranchTip is reachable from the HEAD
+// of developBranch. Use this to verify that a hotfix or release branch has been
+// merged back into develop after being tagged on mainline.
+//
+//	sourceBranchTip = the commit hash at the tip of hotfix/* or release/*
+//	                  before (or at) the merge into mainline.
+//
+// Returns true  → develop already contains the source-branch commits (in sync).
+// Returns false → the source branch has not been merged to develop yet.
+//
+// Note: this check works for regular-merge workflows. For squash-merge
+// workflows the hotfix/release commits are rewritten on main; sync must then
+// be verified by other means (e.g. a VERSION file comparison).
+func IsMainlineSynced(repo *git.Repository, developBranch string, sourceBranchTip plumbing.Hash) (bool, error) {
+	ref, err := repo.Reference(plumbing.NewBranchReferenceName(developBranch), true)
+	if err != nil {
+		return false, fmt.Errorf("resolving branch %q: %w", developBranch, err)
+	}
+	logIter, err := repo.Log(&git.LogOptions{From: ref.Hash()})
+	if err != nil {
+		return false, err
+	}
+	found := false
+	_ = logIter.ForEach(func(c *object.Commit) error {
+		if c.Hash == sourceBranchTip {
+			found = true
+			return storer.ErrStop
+		}
+		return nil
+	})
+	return found, nil
+}
+
+// GetCurrentBranch returns the short branch name of HEAD.
+// Returns an empty string on a detached HEAD.
+func GetCurrentBranch(repo *git.Repository) string {
+	head, err := repo.Head()
+	if err != nil || !head.Name().IsBranch() {
+		return ""
+	}
+	return head.Name().Short()
+}
+
+// CreateVersionTag creates a lightweight tag "vMAJOR.MINOR.PATCH" pointing to HEAD.
+func CreateVersionTag(repo *git.Repository, v SemVer) error {
+	head, err := repo.Head()
+	if err != nil {
+		return fmt.Errorf("resolving HEAD: %w", err)
+	}
+	tagName := fmt.Sprintf("v%d.%d.%d", v.Major, v.Minor, v.Patch)
+	_, err = repo.CreateTag(tagName, head.Hash(), nil)
+	return err
+}
+
 func ReadNextVersionFromYML() (string, error) {
-	data, err := ioutil.ReadFile("GitVersion.yml")
+	data, err := os.ReadFile("GitVersion.yml")
 	if err != nil {
 		return "", err
 	}
@@ -159,7 +395,7 @@ func ReadNextVersionFromYML() (string, error) {
 
 // ReadVersionFromFile and WriteVersionToFile are kept for tests.
 func ReadVersionFromFile(file string) (SemVer, error) {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		return SemVer{}, err
 	}
@@ -167,73 +403,83 @@ func ReadVersionFromFile(file string) (SemVer, error) {
 }
 
 func WriteVersionToFile(file string, v SemVer) error {
-	return ioutil.WriteFile(file, []byte(fmt.Sprintf("%d.%d.%d\n", v.Major, v.Minor, v.Patch)), 0644)
+	return os.WriteFile(file, []byte(fmt.Sprintf("%d.%d.%d\n", v.Major, v.Minor, v.Patch)), 0644)
 }
 
-func getCurrentGitBranch() string {
-	out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
+func getGitInfo(repo *git.Repository) (branch, sha, shortSha, commitDate string, commitCount int) {
+	head, err := repo.Head()
 	if err != nil {
-		return ""
+		return
 	}
-	return strings.TrimSpace(string(out))
-}
 
-func getGitInfo() (branch, sha, shortSha, commitDate string, commitsSince int) {
-	branch = getCurrentGitBranch()
-	if branch != "" {
-		if shaBytes, err := exec.Command("git", "rev-parse", "HEAD").Output(); err == nil {
-			sha = strings.TrimSpace(string(shaBytes))
-			if len(sha) > 7 {
-				shortSha = sha[:7]
-			} else {
-				shortSha = sha
-			}
-		}
-		if dateBytes, err := exec.Command("git", "log", "-1", "--format=%cd", "--date=short").Output(); err == nil {
-			commitDate = strings.TrimSpace(string(dateBytes))
-		}
-		if countBytes, err := exec.Command("git", "rev-list", "--count", "HEAD").Output(); err == nil {
-			commitsSince, _ = strconv.Atoi(strings.TrimSpace(string(countBytes)))
-		}
+	// Branch name (empty string on detached HEAD).
+	if head.Name().IsBranch() {
+		branch = head.Name().Short()
+	}
+
+	sha = head.Hash().String()
+	if len(sha) >= 7 {
+		shortSha = sha[:7]
+	} else {
+		shortSha = sha
+	}
+
+	if commit, err := repo.CommitObject(head.Hash()); err == nil {
+		commitDate = commit.Author.When.Format("2006-01-02")
+	}
+
+	// Count total commits reachable from HEAD.
+	logIter, err := repo.Log(&git.LogOptions{From: head.Hash()})
+	if err == nil {
+		_ = logIter.ForEach(func(_ *object.Commit) error {
+			commitCount++
+			return nil
+		})
 	}
 	return
 }
 
-func getUncommittedChanges() int {
-	out, err := exec.Command("git", "status", "--porcelain").Output()
+func getUncommittedChanges(repo *git.Repository) int {
+	wt, err := repo.Worktree()
 	if err != nil {
 		return 0
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) == 1 && lines[0] == "" {
+	status, err := wt.Status()
+	if err != nil {
 		return 0
 	}
-	return len(lines)
+	count := 0
+	for _, s := range status {
+		if s.Worktree != git.Unmodified || s.Staging != git.Unmodified {
+			count++
+		}
+	}
+	return count
 }
 
-func BuildVersionInfo(v SemVer) VersionInfo {
-	branch, sha, shortSha, commitDate, commitsSince := getGitInfo()
+func BuildVersionInfo(repo *git.Repository, v SemVer) VersionInfo {
+	branch, sha, shortSha, commitDate, commitCount := getGitInfo(repo)
 	mmp := fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Patch)
 	return VersionInfo{
 		Major:                     v.Major,
 		Minor:                     v.Minor,
 		Patch:                     v.Patch,
-		BuildMetaData:             commitsSince,
-		FullBuildMetaData:         fmt.Sprintf("%d.Branch.%s.Sha.%s", commitsSince, branch, sha),
+		BuildMetaData:             commitCount,
+		FullBuildMetaData:         fmt.Sprintf("%d.Branch.%s.Sha.%s", commitCount, branch, sha),
 		MajorMinorPatch:           mmp,
 		SemVer:                    mmp,
 		AssemblySemVer:            mmp + ".0",
 		AssemblySemFileVer:        mmp + ".0",
-		InformationalVersion:      fmt.Sprintf("%s+%d.Branch.%s.Sha.%s", mmp, commitsSince, branch, sha),
-		FullSemVer:                fmt.Sprintf("%s+%d", mmp, commitsSince),
+		InformationalVersion:      fmt.Sprintf("%s+%d.Branch.%s.Sha.%s", mmp, commitCount, branch, sha),
+		FullSemVer:                fmt.Sprintf("%s+%d", mmp, commitCount),
 		BranchName:                branch,
 		EscapedBranchName:         strings.ReplaceAll(branch, "/", "-"),
 		Sha:                       sha,
 		ShortSha:                  shortSha,
 		VersionSourceSha:          sha,
-		CommitsSinceVersionSource: commitsSince,
+		CommitsSinceVersionSource: commitCount,
 		CommitDate:                commitDate,
-		UncommittedChanges:        getUncommittedChanges(),
+		UncommittedChanges:        getUncommittedChanges(repo),
 	}
 }
 

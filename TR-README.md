@@ -2,6 +2,8 @@
 
 [Conventional Commits](https://www.conventionalcommits.org/) kurallarını okuyarak Git repolarında semantic versioning'i otomatikleştiren, CI/CD pipeline'ları için zengin JSON metadata üreten hafif bir CLI aracı.
 
+Versiyon artışları **her zaman commit mesajlarına göre belirlenir** — branch ismine göre değil. Branch yalnızca otomatik tag oluşturmanın nerede tetikleneceğini (yalnızca mainline) kontrol eder.
+
 ## Kurulum & Derleme
 
 ```bash
@@ -16,7 +18,7 @@ Repo kökünde çalıştırın:
 ./new-semver
 ```
 
-Stdout'a JSON metadata basar. Hiçbir dosya yazılmaz veya değiştirilmez.
+Stdout'a JSON metadata basar. Hiçbir dosya yazılmaz veya değiştirilmez (mainline merge tespit edildiğinde yerel git reposuna versiyon tag'i oluşturulur).
 
 ## Versiyon Belirleme Mantığı
 
@@ -26,20 +28,58 @@ Semver git etiketi var mı? (örn. v1.2.3)
   └── Evet  → etiketten bu yana olan commit'leri topla
                 └── Yeni commit var mı?
                       ├── Hayır → etiket versiyonunu değiştirmeden yaz
-                      └── Evet  → Conventional Commit prefix'lerine göre bump yap
+                      └── Evet  → mainline + merge tespit edildi mi?
+                                    ├── Evet → commit'lere göre bump + git tag oluştur
+                                    └── Hayır → commit'lere göre bump (tag yok)
 ```
 
 ### Conventional Commits → Versiyon Artışı
 
+Scope desteği mevcuttur (`feat(auth):`, `fix(parser):`). Tüm commit'ler arasında en yüksek bump kazanır.
+
 | Commit Prefix | Örnek | Etki |
 |---|---|---|
-| `fix:` | `fix: null pointer in auth` | PATCH artışı |
-| `feat:` | `feat: add retry logic` | MINOR artışı |
-| `feat!:` veya `fix!:` | `feat!: drop v1 API` | MAJOR artışı |
-| `BREAKING CHANGE:` | `BREAKING CHANGE: schema renamed` | MAJOR artışı |
+| `fix:` / `fix(scope):` | `fix: null pointer in auth` | PATCH artışı |
+| `feat:` / `feat(scope):` | `feat(api): add retry logic` | MINOR artışı |
+| `feat!:` / `fix!:` (opsiyonel scope ile) | `feat!: drop v1 API` | MAJOR artışı |
+| Footer'da `BREAKING CHANGE:` | `BREAKING CHANGE: schema renamed` | MAJOR artışı |
+| Footer'da `BREAKING-CHANGE:` | `BREAKING-CHANGE: env vars changed` | MAJOR artışı |
 | Diğerleri (`chore:`, `docs:`, vb.) | `chore: update deps` | Artış yok |
 
 > Eşleştirme büyük/küçük harf duyarsızdır. Birden fazla commit varsa en yüksek bump kazanır.
+
+## Branch Stratejisi
+
+go-semver, GitFlow'a dayalı bir model izler. **Bump seviyesi her zaman commit'e göre belirlenir** — branch ismi yalnızca versiyon tag'inin oluşturulup oluşturulmayacağını kontrol eder.
+
+```
+Branch        Nereye merge edilir     Bump          Otomatik tag
+────────────────────────────────────────────────────────────────
+main          —                       —             Evet (merge'de)
+develop       main                    commit-driven main'e merge'de
+release/*     main + develop          commit-driven main'e merge'de
+hotfix/*      main + develop          commit-driven main'e merge'de
+feature/*     develop                 yok           hayır
+```
+
+- **develop** — entegrasyon branch'i. Feature branch'leri buraya merge edilir; develop main'e merge edilir.
+- **release/\*** — bir release'i stabilize etmek için develop'tan ayrılır. Main'e merge edilir (tag tetikler) ve senkronize kalmak için develop'a geri merge edilir.
+- **hotfix/\*** — acil düzeltme için main'den ayrılır. Main'e merge edilir (tag tetikler) ve develop'a geri merge edilir.
+- **feature/\*** — kısa ömürlü geliştirme branch'leri. Tag yok, bump yok; JSON çıktısı yalnızca bilgilendirme amaçlıdır.
+
+Araç mainline üzerinde çalışırken tanınan bir kaynak branch'in merge edildiğini tespit ettiğinde (SOURCE_BRANCH env var **veya** "Merge branch '…'" commit mesajı pattern'i aracılığıyla) versiyon tag'i otomatik olarak oluşturulur.
+
+## Ortam Değişkenleri
+
+| Değişken | Varsayılan | Açıklama |
+|---|---|---|
+| `MAINLINE_BRANCH` | `main` | Production branch'inin adı |
+| `DEVELOP_BRANCH` | `develop` | Entegrasyon branch'inin adı (ekibiniz "test" olarak adlandırıyorsa onu kullanın) |
+| `SOURCE_BRANCH` | _(boş)_ | Squash merge'lerde CI tarafından kaynak branch'i belirtmek için kullanılır; ayarlanmadığında commit mesajı tespitine geri döner |
+
+### Squash Merge Desteği
+
+Squash merge kullanıldığında main üzerindeki sonuç commit'te "Merge branch '…'" mesajı bulunmaz. Merge edilen branch'in adını (örn. `develop`, `release/1.2`, `hotfix/fix-x`) CI pipeline'ınızda `SOURCE_BRANCH` olarak ayarlayın; böylece go-semver merge'i tespit edip versiyon tag'ini oluşturabilir.
 
 ## Yapılandırma
 
@@ -111,6 +151,8 @@ APP_VERSION=$(echo "$VERSION_JSON" | jq -r '.MajorMinorPatch')
 echo "Derlenen versiyon: $APP_VERSION"
 ```
 
+Versiyon dosyası yazılmaz veya geri commit edilmez — go-semver versiyonlamayı tamamen git tag'leri üzerinden yönetir.
+
 ---
 
 ### GitHub Actions
@@ -119,6 +161,8 @@ echo "Derlenen versiyon: $APP_VERSION"
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # versiyon tag'ini push etmek için gerekli
     steps:
       - uses: actions/checkout@v4
         with:
@@ -126,10 +170,12 @@ jobs:
 
       - name: go-semver çalıştır
         id: semver
+        env:
+          SOURCE_BRANCH: ${{ github.head_ref }}   # squash merge tespiti için
         run: |
           VERSION_JSON=$(docker run --rm -v $(pwd):/workspace -w /workspace \
+            -e SOURCE_BRANCH \
             ghcr.io/miraccan00/go-semver:latest)
-          echo "json=$VERSION_JSON" >> $GITHUB_OUTPUT
           echo "version=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')" >> $GITHUB_OUTPUT
 
       - name: Versiyonu kullan
@@ -151,6 +197,8 @@ variables:
 semver:
   image: ghcr.io/miraccan00/go-semver:latest
   stage: .pre
+  variables:
+    SOURCE_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME   # squash merge tespiti için
   script:
     - VERSION_JSON=$(new-semver)
     - echo "APP_VERSION=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')" >> build.env
@@ -231,9 +279,9 @@ fi
 | Durum | Mevcut Davranış |
 |---|---|
 | Detached HEAD (CI checkout) | `BranchName` boş string döner, hata yok |
+| SOURCE_BRANCH olmadan squash merge | Commit mesajı tespitine geri döner; tag oluşturulmasını garantilemek için `SOURCE_BRANCH` ayarlayın |
 | Pre-release versiyonlar (`1.0.0-rc.1`) | `VersionInfo` alanları var ama doldurulmaz |
-| Merge commit mesajları | Conventional prefix yoksa bump olmaz |
-| Çoklu bump kuralı (aynı commit) | İlk eşleşen kazanır: major → minor → patch |
+| Çoklu bump kuralı (birden fazla commit) | En yüksek bump kazanır: major → minor → patch |
 | `git` binary bulunamadı | Git alanları sıfır döner, hata fırlatılmaz |
 | Boş repo (hiç commit yok) | GitVersion.yml fallback çalışır; git alanları boş string |
 
@@ -243,17 +291,22 @@ fi
 go test ./internal/semver/...
 ```
 
-Mevcut kapsam: `ParseVersion`, `BumpByCommitMessage` (6 senaryo).
+Testler şunları kapsar: `ParseVersion`, `BumpByCommits` (scope ve `BREAKING-CHANGE` footer dahil Conventional Commits), `IsMainlineMerge`, `DetectMergeFrom*`, `GetMainlineBranch`, `GetDevelopBranch`, `GetSourceBranch`, `CreateVersionTag` ve tam uçtan uca branch akışı senaryoları.
 
 ## Proje Yapısı
 
 ```
-cmd/new-semver/main.go          # CLI giriş noktası
-internal/semver/semver.go       # Core kütüphane
-internal/semver/semver_test.go  # Unit testler
-GitVersion.yml                  # Git etiketi yokken kullanılan fallback versiyon
+cmd/new-semver/main.go                       # CLI giriş noktası
+internal/semver/semver.go                    # Core kütüphane
+internal/semver/semver_test.go               # Unit testler
+internal/semver/semver_scenario_test.go      # Entegrasyon / senaryo testleri
+GitVersion.yml                               # Fallback versiyon + branch konfigürasyon dokümantasyonu
+ci-integration-example/                      # Kullanıma hazır CI pipeline şablonları
+  github-actions.yml
+  gitlab-ci.yml
+  azure-pipelines.yml
 ```
 
 ## Katkıda Bulunma
 
-Pull request'ler memnuniyetle karşılanır. Yeni özellik eklerken lütfen edge case'leri `internal/semver/semver_test.go` içinde test edin.
+Pull request'ler memnuniyetle karşılanır. Yeni özellik eklerken lütfen edge case'leri `internal/semver/semver_test.go` içinde, branch akışı davranışları için ise `semver_scenario_test.go` içinde test edin.

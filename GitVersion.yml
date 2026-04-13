@@ -1,10 +1,74 @@
-next-version: 0.0.1
+# go-semver — Branch Versioning Framework
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  Branch         │  Merges into       │  Bump            │  Auto-tag     │
+# ├─────────────────┼────────────────────┼──────────────────┼───────────────┤
+# │  main           │  —                 │  —               │  yes*         │
+# │  develop        │  main              │  commit-driven   │  on merge     │
+# │  release/*      │  main + develop    │  commit-driven   │  on merge     │
+# │  hotfix/*       │  main + develop    │  commit-driven   │  on merge     │
+# │  feature/*      │  develop           │  none            │  no           │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# * Tag is created automatically when running on mainline and a recognised
+#   merge is detected (SOURCE_BRANCH env var OR "Merge branch '…'" message).
+#
+# Bump level is ALWAYS driven by Conventional Commits — not by branch name:
+#   fix: (with optional scope)       →  Patch
+#   feat: (with optional scope)      →  Minor
+#   feat!: / fix!: (with scope)      →  Major
+#   BREAKING CHANGE / BREAKING-CHANGE in footer  →  Major
+#
+# release/* branches from develop to stabilise a release. After merge into
+# main (and auto-tag), it MUST also be merged back into develop to keep the
+# integration branch in sync.
+#
+# hotfix/* branches from main for emergency fixes. After merge into main (and
+# auto-tag), it MUST also be merged back into develop.
+#
+# Environment variables:
+#   MAINLINE_BRANCH   Name of the production branch  (default: main)
+#   DEVELOP_BRANCH    Name of the integration branch (default: develop)
+#   SOURCE_BRANCH     Set by CI for squash merges to identify the source;
+#                     falls back to commit-message pattern detection.
+
+next-version: 0.1.0   # used as the starting version before the first git tag
+
 mode: ContinuousDeployment
+
 branches:
   main:
-    increment: Minor
-    prevent-increment-of-merged-branch-version: true
-    track-merge-target: false
     regex: ^main$
-    source-branches: ['develop']
     is-mainline: true
+    source-branches:
+      - develop       # merge detected → commit-driven bump + auto-tag
+      - release/*     # merge detected → commit-driven bump + auto-tag
+      - hotfix/*      # merge detected → commit-driven bump + auto-tag
+
+  develop:
+    regex: ^develop$
+    source-branches:
+      - feature/*
+    # Conventional-commit bumping (no auto-tag).
+    # CI uses JSON output for build metadata only.
+
+  release:
+    regex: ^release/
+    source-branches:
+      - develop
+    # Branch cut from develop to stabilise a release.
+    # Merge into main triggers auto-tag; also merge back into develop after.
+
+  hotfix:
+    regex: ^hotfix/
+    source-branches:
+      - main
+    # Emergency fix branched directly from main.
+    # Merge into main triggers auto-tag; also merge back into develop after.
+
+  feature:
+    regex: ^feature/
+    source-branches:
+      - develop
+    # Short-lived development branches.
+    # No tag, no bump — JSON output is informational only.

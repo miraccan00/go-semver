@@ -1,0 +1,12 @@
+# Compiled binary
+new-semver
+dist/
+
+# Test binaries and output
+*.test
+*.out
+coverage.html
+
+# OS
+.DS_Store
+Thumbs.db

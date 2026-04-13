@@ -20,6 +20,7 @@ ci-integration-example/                  # Ready-to-use CI pipeline templates
   azure-pipelines.yml
 .github/workflows/ci.yml                 # PR validation: tests + build
 .github/workflows/release.yml            # Merge to master: semver tag + Docker push
+.github/workflows/bootstrap.yml          # One-time admin-only initial image push
 Dockerfile                               # Docker image definition
 go.mod                                   # Module name: semver, Go 1.24.1
 ```
@@ -206,7 +207,9 @@ docker run --rm -v $(pwd):/workspace -w /workspace ghcr.io/miraccan00/go-semver:
 
 Mount your repo root to `/workspace`; the container has `git` installed.
 
-The tool's own Docker image is built and pushed by [`.github/workflows/release.yml`](.github/workflows/release.yml) on every merge to master. There is no separate docker-push workflow.
+The tool's own Docker image is built and pushed by `.github/workflows/release.yml` on every merge to master. There is no separate docker-push workflow.
+
+**First-time bootstrap**: run `.github/workflows/bootstrap.yml` manually (admin-only, see GitHub repository setup below).
 
 ---
 
@@ -288,36 +291,39 @@ Key dependency: `github.com/go-git/go-git/v5` — pure-Go git implementation use
 
 ---
 
-## Common tasks
-
-**Add a new env var** — follow the `GetDevelopBranch()` pattern: read env, return default. Update `GitVersion.yml` comments, `README.md`, `TR-README.md`, and add a `TestGetXxx` unit test.
-
-**Add a new CC type** — add a regex at package level, update `BumpByCommits`, add test cases in `TestBumpByCommits_*`.
-
-**Add a new branch type** — add a `DetectMergeFrom*` function, call it in `IsMainlineMerge`, update `GitVersion.yml`, `README.md`, `TR-README.md`, and add a scenario test.
-
-**Change bump logic** — all bump logic is in `BumpByCommits` in `semver.go`. The CC regexes are package-level vars.
-
-**Debug version output** — run `./semver` from the repo root; it prints JSON to stdout. Set `SOURCE_BRANCH`, `MAINLINE_BRANCH`, or `DEVELOP_BRANCH` env vars as needed to simulate CI conditions.
-
----
-
 ## GitHub repository setup (one-time)
 
-### Branch protection rules
+### 1. Create the `bootstrap` environment
 
-Configure via **Settings → Branches → Add rule** in the GitHub UI, or with `gh`:
+Go to **Settings → Environments → New environment** → name it `bootstrap`.
+Under **Required reviewers**, add repo admins only. This gates the bootstrap workflow behind a manual approval step.
+
+### 2. Bootstrap the first Docker image
+
+Once the environment is configured, trigger the workflow manually:
 
 ```bash
-# Protect master: require PR, require CI to pass, no direct push
+gh workflow run bootstrap.yml --ref master
+# or via GitHub UI: Actions → Bootstrap → Run workflow
+```
+
+The workflow:
+1. Checks the triggering actor has `admin` permission via the GitHub API (hard fail if not).
+2. Awaits environment approval from a required reviewer.
+3. Builds and pushes `ghcr.io/miraccan00/go-semver:<next-version>` and `:latest`.
+
+After this runs once, `release.yml` is self-sustaining.
+
+### 3. Branch protection rules
+
+Configure via **Settings → Branches → Add rule**, or with `gh`:
+
+```bash
+# Protect master: require PR + CI pass, no direct push
 gh api repos/{owner}/go-semver/branches/master/protection \
-  --method PUT \
-  --input - <<'EOF'
+  --method PUT --input - <<'EOF'
 {
-  "required_status_checks": {
-    "strict": true,
-    "contexts": ["test"]
-  },
+  "required_status_checks": { "strict": true, "contexts": ["test"] },
   "enforce_admins": false,
   "required_pull_request_reviews": {
     "required_approving_review_count": 1,
@@ -329,19 +335,13 @@ gh api repos/{owner}/go-semver/branches/master/protection \
 }
 EOF
 
-# Protect develop: require PR, require CI to pass
+# Protect develop: require PR + CI pass
 gh api repos/{owner}/go-semver/branches/develop/protection \
-  --method PUT \
-  --input - <<'EOF'
+  --method PUT --input - <<'EOF'
 {
-  "required_status_checks": {
-    "strict": false,
-    "contexts": ["test"]
-  },
+  "required_status_checks": { "strict": false, "contexts": ["test"] },
   "enforce_admins": false,
-  "required_pull_request_reviews": {
-    "required_approving_review_count": 1
-  },
+  "required_pull_request_reviews": { "required_approving_review_count": 1 },
   "restrictions": null,
   "allow_force_pushes": false,
   "allow_deletions": false
@@ -356,20 +356,31 @@ master     ← PRs only from: develop, release/*, hotfix/*
 develop    ← PRs only from: feature/*
 feature/*  ← branch from develop; delete after merge
 release/*  ← branch from develop; merge to master AND back to develop
-hotfix/*   ← branch from master; merge to master AND back to develop
+hotfix/*   ← branch from master;  merge to master AND back to develop
 ```
 
 **Workflow triggered on PR merge to master** (`release.yml`):
-1. `SOURCE_BRANCH` is read from `github.event.pull_request.head.ref` — no commit-message parsing needed, works with both merge and squash strategies.
-2. Semver container (`ghcr.io/miraccan00/go-semver:latest`) runs in the workspace with `MAINLINE_BRANCH=master` and the detected `SOURCE_BRANCH`.
-3. If `IsMainlineMerge` returns true, the tool bumps the version, creates the tag in `.git`, and the workflow pushes it.
-4. Docker image is built and pushed as `ghcr.io/miraccan00/go-semver:<version>` and `:latest`.
+1. `SOURCE_BRANCH` is read from `github.event.pull_request.head.ref` — works with both merge and squash strategies.
+2. Semver container runs with `MAINLINE_BRANCH=master` + detected `SOURCE_BRANCH`.
+3. Tool bumps version, creates tag in `.git`, workflow pushes the tag.
+4. Docker image pushed as `ghcr.io/miraccan00/go-semver:<version>` and `:latest`.
 
 ---
 
-## Important design decisions (do not revert)
+## Common tasks
+
+**Add a new env var** — follow the `GetDevelopBranch()` pattern: read env, return default. Update `GitVersion.yml` comments, `README.md`, `TR-README.md`, and add a `TestGetXxx` unit test.
+
+**Add a new CC type** — add a regex at package level, update `BumpByCommits`, add test cases in `TestBumpByCommits_*`.
+
+**Add a new branch type** — add a `DetectMergeFrom*` function, call it in `IsMainlineMerge`, update `GitVersion.yml`, `README.md`, `TR-README.md`, and add a scenario test.
+
+**Change bump logic** — all bump logic is in `BumpByCommits` in `semver.go`. The CC regexes are package-level vars.
+
+**Debug version output** — run `./semver` from the repo root; it prints JSON to stdout. Set `SOURCE_BRANCH`, `MAINLINE_BRANCH`, or `DEVELOP_BRANCH` env vars as needed to simulate CI conditions.
+
+**Important design decisions (do not revert)**:
 - `hasBreakingChangeFooter` uses `HasPrefix` (not `Contains`) to avoid matching body prose like "no breaking change" — this was a deliberate fix for a test regression.
 - `GetCommitMessagesSinceTag` returns **full** messages (not just subject lines) — required so footer tokens are detectable.
 - `IsMainlineMerge` is purely a detection function; it does **not** apply a bump. Bump is always `BumpByCommits`.
 - There is no `BumpForMainlineMerge` function — it was removed when source-branch-based bumping was replaced with commit-driven bumping.
-- `release.yml` uses `pull_request: types: [closed]` (not `push: branches: [master]`) so that `github.event.pull_request.head.ref` is available for `SOURCE_BRANCH` detection — avoids fragile commit-message parsing for GitHub-style merge commits ("Merge pull request #N from owner/branch").

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"new-semver/internal/semver"
+	"semver/internal/semver"
 )
 
 func main() {

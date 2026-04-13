@@ -32,7 +32,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history so new-semver can read git log
+          fetch-depth: 0   # full history so semver can read git log
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

@@ -7,7 +7,7 @@ Versiyon artışları **her zaman commit mesajlarına göre belirlenir** — bra
 ## Kurulum & Derleme
 
 ```bash
-go build -o new-semver ./cmd/new-semver
+go build -o semver ./cmd/semver
 ```
 
 ## Kullanım
@@ -15,7 +15,7 @@ go build -o new-semver ./cmd/new-semver
 Repo kökünde çalıştırın:
 
 ```bash
-./new-semver
+./semver
 ```
 
 Stdout'a JSON metadata basar. Hiçbir dosya yazılmaz veya değiştirilmez (mainline merge tespit edildiğinde yerel git reposuna versiyon tag'i oluşturulur).
@@ -200,7 +200,7 @@ semver:
   variables:
     SOURCE_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME   # squash merge tespiti için
   script:
-    - VERSION_JSON=$(new-semver)
+    - VERSION_JSON=$(semver)
     - echo "APP_VERSION=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')" >> build.env
     - echo "SHORT_SHA=$(echo $VERSION_JSON | jq -r '.ShortSha')" >> build.env
   artifacts:
@@ -296,7 +296,7 @@ Testler şunları kapsar: `ParseVersion`, `BumpByCommits` (scope ve `BREAKING-CH
 ## Proje Yapısı
 
 ```
-cmd/new-semver/main.go                       # CLI giriş noktası
+cmd/semver/main.go                       # CLI giriş noktası
 internal/semver/semver.go                    # Core kütüphane
 internal/semver/semver_test.go               # Unit testler
 internal/semver/semver_scenario_test.go      # Entegrasyon / senaryo testleri

@@ -1,5 +1,5 @@
 # Compiled binary
-new-semver
+semver
 dist/
 
 # Test binaries and output

@@ -1,4 +1,4 @@
-module new-semver
+module semver
 
 go 1.24.1
 

@@ -2,14 +2,14 @@
 
 ## What this repository is
 
-`go-semver` is a standalone CLI tool (`new-semver`) that computes a [Semantic Versioning](https://semver.org/) number for a Git repository by reading [Conventional Commits](https://www.conventionalcommits.org/) and outputs rich JSON metadata for use in CI/CD pipelines. It manages versioning entirely through **git tags** — no VERSION file is written or committed back.
+`go-semver` is a standalone CLI tool (`semver`) that computes a [Semantic Versioning](https://semver.org/) number for a Git repository by reading [Conventional Commits](https://www.conventionalcommits.org/) and outputs rich JSON metadata for use in CI/CD pipelines. It manages versioning entirely through **git tags** — no VERSION file is written or committed back.
 
 ---
 
 ## Repository layout
 
 ```
-cmd/new-semver/main.go                  # CLI entry point
+cmd/semver/main.go                  # CLI entry point
 internal/semver/semver.go               # Core library (all logic lives here)
 internal/semver/semver_test.go          # Unit tests
 internal/semver/semver_scenario_test.go # End-to-end branch-flow scenarios
@@ -20,7 +20,7 @@ ci-integration-example/                 # Ready-to-use CI pipeline templates
   azure-pipelines.yml
 .github/workflows/docker-push.yml       # Tool's own CI (builds & pushes Docker image)
 Dockerfile                              # Docker image definition
-go.mod                                  # Module name: new-semver, Go 1.24.1
+go.mod                                  # Module name: semver, Go 1.24.1
 ```
 
 No `VERSION` file — that was removed. No `testdata/` directory — tests use `t.TempDir()`.
@@ -41,11 +41,11 @@ hotfix/*      main + develop       commit-driven     on merge to main
 feature/*     develop              none              no
 ```
 
-A version tag (`vX.Y.Z`) is created automatically when `new-semver` runs **on the mainline branch** and `IsMainlineMerge()` returns true.
+A version tag (`vX.Y.Z`) is created automatically when `semver` runs **on the mainline branch** and `IsMainlineMerge()` returns true.
 
 ---
 
-## How the CLI works (`cmd/new-semver/main.go`)
+## How the CLI works (`cmd/semver/main.go`)
 
 ```
 1. OpenRepo()                         — open .git in cwd
@@ -210,7 +210,7 @@ The tool's own Docker image is built by `.github/workflows/docker-push.yml` on e
 ```bash
 go test ./...                    # run all tests
 go test ./internal/semver/...    # library tests only
-go build ./cmd/new-semver/       # verify binary compiles
+go build ./cmd/semver/       # verify binary compiles
 ```
 
 ### Test pattern: Arrange-Act-Assert (AAA)
@@ -276,7 +276,7 @@ Regular merges are simulated via `CommitOptions.Parents` with second parent = so
 
 ## Module & dependencies
 
-Module name: `new-semver` (in `go.mod`)
+Module name: `semver` (in `go.mod`)
 
 Key dependency: `github.com/go-git/go-git/v5` — pure-Go git implementation used for all git operations (no `git` binary required at runtime; it is included in the Docker image for the few places that need it).
 
@@ -292,7 +292,7 @@ Key dependency: `github.com/go-git/go-git/v5` — pure-Go git implementation use
 
 **Change bump logic** — all bump logic is in `BumpByCommits` in `semver.go`. The CC regexes are package-level vars.
 
-**Debug version output** — run `./new-semver` from the repo root; it prints JSON to stdout. Set `SOURCE_BRANCH`, `MAINLINE_BRANCH`, or `DEVELOP_BRANCH` env vars as needed to simulate CI conditions.
+**Debug version output** — run `./semver` from the repo root; it prints JSON to stdout. Set `SOURCE_BRANCH`, `MAINLINE_BRANCH`, or `DEVELOP_BRANCH` env vars as needed to simulate CI conditions.
 
 **Important design decisions (do not revert)**:
 - `hasBreakingChangeFooter` uses `HasPrefix` (not `Contains`) to avoid matching body prose like "no breaking change" — this was a deliberate fix for a test regression.

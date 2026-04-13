@@ -7,7 +7,7 @@ Version bumps are **always driven by commit messages** — never by branch name.
 ## Install & Build
 
 ```bash
-go build -o new-semver ./cmd/new-semver
+go build -o semver ./cmd/semver
 ```
 
 ## Usage
@@ -15,7 +15,7 @@ go build -o new-semver ./cmd/new-semver
 Run from the root of your Git repository:
 
 ```bash
-./new-semver
+./semver
 ```
 
 Prints a JSON metadata object to stdout. No files are written or modified (version tags are created in the local git repo when a mainline merge is detected).
@@ -200,7 +200,7 @@ semver:
   variables:
     SOURCE_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME   # squash-merge detection
   script:
-    - VERSION_JSON=$(new-semver)
+    - VERSION_JSON=$(semver)
     - echo "APP_VERSION=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')" >> build.env
     - echo "SHORT_SHA=$(echo $VERSION_JSON | jq -r '.ShortSha')" >> build.env
   artifacts:
@@ -296,7 +296,7 @@ Tests cover: `ParseVersion`, `BumpByCommits` (Conventional Commits including sco
 ## Project Structure
 
 ```
-cmd/new-semver/main.go                       # CLI entry point
+cmd/semver/main.go                       # CLI entry point
 internal/semver/semver.go                    # Core library
 internal/semver/semver_test.go               # Unit tests
 internal/semver/semver_scenario_test.go      # Integration / scenario tests

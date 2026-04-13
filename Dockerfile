@@ -10,7 +10,7 @@ RUN go mod download
 COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags="-s -w" -o /out/new-semver ./cmd/new-semver
+    go build -trimpath -ldflags="-s -w" -o /out/semver ./cmd/semver
 
 # ── Stage 2: runtime ───────────────────────────────────────────────────────────
 FROM alpine:3.21
@@ -23,8 +23,8 @@ RUN addgroup -S semver && adduser -S semver -G semver
 
 WORKDIR /workspace
 
-COPY --from=builder /out/new-semver /usr/local/bin/new-semver
+COPY --from=builder /out/semver /usr/local/bin/semver
 
 USER semver
 
-ENTRYPOINT ["new-semver"]
+ENTRYPOINT ["semver"]

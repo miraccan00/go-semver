@@ -32,7 +32,6 @@ variables:
 
 stages:
   - version
-  - test
   - build
   - publish
 
@@ -56,11 +55,11 @@ semver:
         exit 1
       fi
 
-    # Export variables for downstream jobs via dotenv artifact
-    - echo "APP_VERSION=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')"          >> build.env
-    - echo "FULL_SEMVER=$(echo $VERSION_JSON | jq -r '.FullSemVer')"               >> build.env
-    - echo "SHORT_SHA=$(echo $VERSION_JSON | jq -r '.ShortSha')"                   >> build.env
-    - echo "BRANCH_NAME=$(echo $VERSION_JSON | jq -r '.EscapedBranchName')"        >> build.env
+    # Export version fields for all downstream jobs via dotenv artifact
+    - echo "APP_VERSION=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')"   >> build.env
+    - echo "FULL_SEMVER=$(echo $VERSION_JSON | jq -r '.FullSemVer')"        >> build.env
+    - echo "SHORT_SHA=$(echo $VERSION_JSON   | jq -r '.ShortSha')"          >> build.env
+    - echo "BRANCH_NAME=$(echo $VERSION_JSON | jq -r '.EscapedBranchName' | tr '[:upper:]' '[:lower:]')" >> build.env
 
     # go-semver writes the tag into the local .git — push it back to origin.
     # CI_JOB_TOKEN has write access to the project repository by default.
@@ -76,30 +75,18 @@ semver:
       dotenv: build.env     # APP_VERSION etc. are injected into all downstream jobs
     expire_in: 1 day
 
-# ── Stage: test ───────────────────────────────────────────────────────────────
-unit-tests:
-  stage: test
-  image: golang:1.24-alpine
-  needs: []                 # runs in parallel with semver
-  script:
-    - go test ./...
-
 # ── Stage: build ──────────────────────────────────────────────────────────────
-build-binary:
+# APP_VERSION, FULL_SEMVER, SHORT_SHA, BRANCH_NAME are available as env vars
+# in all jobs after the version stage (injected via dotenv artifact).
+# Replace the placeholder script with your own build & test commands.
+build:
   stage: build
-  image: golang:1.24-alpine
-  needs: [semver]           # APP_VERSION injected via dotenv
+  needs: [semver]
   script:
-    - echo "Building version $APP_VERSION (commit $SHORT_SHA)"
-    - |
-      go build \
-        -ldflags "-X main.version=$APP_VERSION -X main.commit=$SHORT_SHA" \
-        -o dist/myapp \
-        ./cmd/myapp
-  artifacts:
-    paths:
-      - dist/
-    expire_in: 1 day
+    - echo "Building version $APP_VERSION (commit $SHORT_SHA, branch $BRANCH_NAME)"
+    # e.g. npm ci && npm test && npm run build
+    # e.g. mvn verify -Drevision=$APP_VERSION
+    # e.g. docker build --build-arg VERSION=$APP_VERSION .
 
 build-docker:
   stage: build

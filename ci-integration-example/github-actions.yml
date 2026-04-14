@@ -24,10 +24,10 @@ jobs:
     name: Resolve Version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.semver.outputs.version }}
-      full_semver: ${{ steps.semver.outputs.full_semver }}
-      short_sha: ${{ steps.semver.outputs.short_sha }}
-      branch: ${{ steps.semver.outputs.branch }}
+      version:      ${{ steps.semver.outputs.version }}
+      full_semver:  ${{ steps.semver.outputs.full_semver }}
+      short_sha:    ${{ steps.semver.outputs.short_sha }}
+      branch:       ${{ steps.semver.outputs.branch }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,10 +51,10 @@ jobs:
             -e SOURCE_BRANCH \
             ghcr.io/miraccan00/go-semver:latest)
 
-          echo "version=$(echo $VERSION_JSON | jq -r '.MajorMinorPatch')"   >> $GITHUB_OUTPUT
-          echo "full_semver=$(echo $VERSION_JSON | jq -r '.FullSemVer')"    >> $GITHUB_OUTPUT
-          echo "short_sha=$(echo $VERSION_JSON | jq -r '.ShortSha')"        >> $GITHUB_OUTPUT
-          echo "branch=$(echo $VERSION_JSON | jq -r '.EscapedBranchName')"  >> $GITHUB_OUTPUT
+          echo "version=$(echo $VERSION_JSON     | jq -r '.MajorMinorPatch')"  >> $GITHUB_OUTPUT
+          echo "full_semver=$(echo $VERSION_JSON | jq -r '.FullSemVer')"       >> $GITHUB_OUTPUT
+          echo "short_sha=$(echo $VERSION_JSON   | jq -r '.ShortSha')"         >> $GITHUB_OUTPUT
+          echo "branch=$(echo $VERSION_JSON      | jq -r '.EscapedBranchName')">> $GITHUB_OUTPUT
 
           # Fail fast on a dirty workspace
           DIRTY=$(echo "$VERSION_JSON" | jq '.UncommittedChanges')
@@ -73,29 +73,23 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-latest
     needs: version
+    # Version fields are available as env vars throughout this job.
+    # Replace the placeholder steps below with your own build commands.
+    env:
+      APP_VERSION: ${{ needs.version.outputs.version }}
+      FULL_SEMVER: ${{ needs.version.outputs.full_semver }}
+      SHORT_SHA:   ${{ needs.version.outputs.short_sha }}
+      BRANCH_NAME: ${{ needs.version.outputs.branch }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-
-      - name: Run tests
-        run: go test ./...
-
-      - name: Build binary
+      # ── Replace with your build & test commands ──────────────────────────────
+      - name: Build & test
         run: |
-          go build -ldflags "-X main.version=${{ needs.version.outputs.version }}" \
-            -o dist/myapp ./cmd/myapp
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: myapp-${{ needs.version.outputs.version }}
-          path: dist/
+          echo "Building version $APP_VERSION (commit $SHORT_SHA, branch $BRANCH_NAME)"
+          # e.g. npm ci && npm test && npm run build
+          # e.g. mvn verify -Drevision=$APP_VERSION
+          # e.g. docker build --build-arg VERSION=$APP_VERSION .
 
   docker:
     name: Build & Push Docker Image
@@ -103,6 +97,14 @@ jobs:
     needs: [version, build]
     steps:
       - uses: actions/checkout@v4
+
+      # Docker registry tags must be lowercase — github.repository can contain
+      # uppercase letters (e.g. "MyOrg/My-Repo"). Normalize here.
+      - name: Set lowercase image name
+        id: meta
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "image=${IMAGE,,}" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -122,9 +124,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.short_sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ steps.meta.outputs.image }}:${{ needs.version.outputs.version }}
+            ${{ steps.meta.outputs.image }}:${{ needs.version.outputs.short_sha }}
+            ${{ steps.meta.outputs.image }}:latest
           build-args: |
             APP_VERSION=${{ needs.version.outputs.version }}
           cache-from: type=gha
